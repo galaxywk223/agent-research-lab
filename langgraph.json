@@ -1,0 +1,14 @@
+{
+    "dockerfile_lines": [],
+    "graphs": {
+      "deep_research": "./backend/src/agent_research_lab/deep_researcher.py:deep_research"
+    },
+    "python_version": "3.11",
+    "env": "./.env",
+    "dependencies": [
+      "."
+    ],
+    "auth": {
+      "path": "./backend/src/security/auth.py:auth"
+    }
+}
