@@ -27,9 +27,15 @@ logger = logging.getLogger(__name__)
 _current: contextvars.ContextVar[ResearchMetrics | None] = contextvars.ContextVar(
     "agentlab_metrics", default=None
 )
-_task: contextvars.ContextVar[str | None] = contextvars.ContextVar("agentlab_metrics_task", default=None)
-_round: contextvars.ContextVar[int | None] = contextvars.ContextVar("agentlab_metrics_round", default=None)
-_attempt: contextvars.ContextVar[str | None] = contextvars.ContextVar("agentlab_metrics_attempt", default=None)
+_task: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "agentlab_metrics_task", default=None
+)
+_round: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "agentlab_metrics_round", default=None
+)
+_attempt: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "agentlab_metrics_attempt", default=None
+)
 _collectors: dict[str, ResearchMetrics] = {}
 
 
@@ -96,9 +102,14 @@ class _UsageObserver(BaseCallbackHandler):
     def on_chat_model_start(self, serialized, messages, **kwargs):
         """Capture only non-secret resolved model parameters."""
         from agent_research_lab.observability import safe_endpoint
+
         params = kwargs.get("invocation_params") or {}
-        self.model_facts["requested_model"] = params.get("model_name") or params.get("model")
-        self.model_facts["base_url"] = safe_endpoint(params.get("openai_api_base") or os.getenv("OPENAI_BASE_URL"))
+        self.model_facts["requested_model"] = params.get("model_name") or params.get(
+            "model"
+        )
+        self.model_facts["base_url"] = safe_endpoint(
+            params.get("openai_api_base") or os.getenv("OPENAI_BASE_URL")
+        )
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         """Keep only usage actually returned by the provider."""
@@ -108,8 +119,12 @@ class _UsageObserver(BaseCallbackHandler):
             for generation in getattr(response, "generations", []):
                 for item in generation:
                     usage = extract_usage(getattr(item, "message", None))
-                    metadata = getattr(getattr(item, "message", None), "response_metadata", {})
-                    self.model_facts["returned_model"] = metadata.get("model_name") or metadata.get("model")
+                    metadata = getattr(
+                        getattr(item, "message", None), "response_metadata", {}
+                    )
+                    self.model_facts["returned_model"] = metadata.get(
+                        "model_name"
+                    ) or metadata.get("model")
                     if usage is not None:
                         break
         if usage is not None:
@@ -161,12 +176,17 @@ class ResearchMetrics(ObservationMixin):
         self.final_report: str | None = None
         self.source_urls: list[str] = []
         self.incomplete = False
-        self.usage_source = "simulated" if os.getenv("AGENTLAB_PROVIDER_MODE") == "fake" else "provider"
+        self.usage_source = (
+            "simulated" if os.getenv("AGENTLAB_PROVIDER_MODE") == "fake" else "provider"
+        )
         self.persisted_evidence_count: int | None = None
         self.persisted_hash_duplicates: int | None = None
 
     async def llm(
-        self, role: str, response: Any, duration_ms: float | None = None,
+        self,
+        role: str,
+        response: Any,
+        duration_ms: float | None = None,
         observed_usage: list[dict[str, int]] | None = None,
     ) -> None:
         """Record one logical invocation and provider-reported usage."""
@@ -174,13 +194,19 @@ class ResearchMetrics(ObservationMixin):
         await self.finish_llm(event, response, observed_usage or [])
         event["latency_ms"] = duration_ms
 
-    async def provider_request(self, query: str, latency_ms: float, result_count: int | None) -> None:
+    async def provider_request(
+        self, query: str, latency_ms: float, result_count: int | None
+    ) -> None:
         """Record one actual Tavily request's monotonic duration."""
         async with self._lock:
-            self.search_request_events.append({
-                **self.event_scope(), "query": query, "latency_ms": round(latency_ms, 3),
-                "result_count": result_count,
-            })
+            self.search_request_events.append(
+                {
+                    **self.event_scope(),
+                    "query": query,
+                    "latency_ms": round(latency_ms, 3),
+                    "result_count": result_count,
+                }
+            )
 
     def task(self, task_id: str, topic: str = "") -> TaskMetrics:
         """Get a task-local metrics bucket."""
@@ -202,7 +228,11 @@ class ResearchMetrics(ObservationMixin):
             task_id = _task.get()
             task = self.task(task_id) if task_id else None
             round_index = _round.get()
-            round_metrics = self._round_for(task_id, round_index) if task_id and round_index else None
+            round_metrics = (
+                self._round_for(task_id, round_index)
+                if task_id and round_index
+                else None
+            )
             if not scoped_tool:
                 self.search["search_tool_calls"] += 1
                 self.search["search_query_count"] += len(queries)
@@ -249,16 +279,26 @@ class ResearchMetrics(ObservationMixin):
         """Record hashes of Evidence content submitted to persistence."""
         async with self._lock:
             for observation in observations:
-                digest = content_hash(observation.get("content"), observation.get("snippet"))
+                digest = content_hash(
+                    observation.get("content"), observation.get("snippet")
+                )
                 if digest:
-                    self.search["content_hash_duplicate_count"] += digest in self._seen_hashes
+                    self.search["content_hash_duplicate_count"] += (
+                        digest in self._seen_hashes
+                    )
                     self._seen_hashes.add(digest)
 
     def _round_for(self, task_id: str, round_index: int) -> ResearcherRoundMetrics:
         for round_metrics in self.rounds:
-            if round_metrics.task_id == task_id and round_metrics.round_index == round_index and getattr(round_metrics, "attempt_id", None) == _attempt.get():
+            if (
+                round_metrics.task_id == task_id
+                and round_metrics.round_index == round_index
+                and getattr(round_metrics, "attempt_id", None) == _attempt.get()
+            ):
                 return round_metrics
-        round_metrics = ResearcherRoundMetrics(task_id, round_index, [], [], [], [], [], 0, 0, 0, 0, 0, 0.0)
+        round_metrics = ResearcherRoundMetrics(
+            task_id, round_index, [], [], [], [], [], 0, 0, 0, 0, 0, 0.0
+        )
         round_metrics.attempt_id = _attempt.get()
         self.rounds.append(round_metrics)
         return round_metrics
@@ -274,19 +314,40 @@ class ResearchMetrics(ObservationMixin):
     ) -> None:
         """Record novelty within one task's independent round sequence."""
         async with self._lock:
-            self._add_round(task_id, round_index, queries, returned_urls, content_hashes, latency_ms)
+            self._add_round(
+                task_id, round_index, queries, returned_urls, content_hashes, latency_ms
+            )
 
     def _add_round(
-        self, task_id: str, round_index: int, queries: list[str],
-        returned_urls: list[str], content_hashes: list[str], latency_ms: float,
+        self,
+        task_id: str,
+        round_index: int,
+        queries: list[str],
+        returned_urls: list[str],
+        content_hashes: list[str],
+        latency_ms: float,
     ) -> None:
         bucket = self._round_for(task_id, round_index)
         snapshot_urls = bucket.returned_urls or returned_urls
         normalized = [u for u in (normalize_url(x) for x in snapshot_urls) if u]
         domains = [d for d in (extract_domain(u) for u in normalized) if d]
         task = self.task(task_id)
-        before = {u for item in self.rounds if item.task_id == task_id and item.round_index < round_index and getattr(item, "attempt_id", None) == _attempt.get() for u in item.normalized_urls}
-        before_domains = {d for item in self.rounds if item.task_id == task_id and item.round_index < round_index and getattr(item, "attempt_id", None) == _attempt.get() for d in item.domains}
+        before = {
+            u
+            for item in self.rounds
+            if item.task_id == task_id
+            and item.round_index < round_index
+            and getattr(item, "attempt_id", None) == _attempt.get()
+            for u in item.normalized_urls
+        }
+        before_domains = {
+            d
+            for item in self.rounds
+            if item.task_id == task_id
+            and item.round_index < round_index
+            and getattr(item, "attempt_id", None) == _attempt.get()
+            for d in item.domains
+        }
         task.urls.update(normalized)
         task.domains.update(domains)
         task.hashes.update(h for h in content_hashes if h)
@@ -301,19 +362,35 @@ class ResearchMetrics(ObservationMixin):
         if content_hashes:
             round_metrics.content_hashes = content_hashes
         round_metrics.new_unique_urls = len(set(normalized) - before)
-        round_metrics.repeated_urls = len(set(normalized)) - round_metrics.new_unique_urls
-        round_metrics.duplicate_ratio = round_metrics.repeated_urls / len(set(normalized)) if normalized else None
+        round_metrics.repeated_urls = (
+            len(set(normalized)) - round_metrics.new_unique_urls
+        )
+        round_metrics.duplicate_ratio = (
+            round_metrics.repeated_urls / len(set(normalized)) if normalized else None
+        )
         round_metrics.returned_unique_urls = len(set(normalized))
         round_metrics.domains_seen_this_round = len(set(domains))
-        round_metrics.novelty_ratio = round_metrics.new_unique_urls / len(set(normalized)) if normalized else None
+        round_metrics.novelty_ratio = (
+            round_metrics.new_unique_urls / len(set(normalized)) if normalized else None
+        )
         round_metrics.new_domains = len(set(domains) - before_domains)
-        round_metrics.domain_novelty_ratio = round_metrics.new_domains / len(set(domains)) if domains else None
+        round_metrics.domain_novelty_ratio = (
+            round_metrics.new_domains / len(set(domains)) if domains else None
+        )
         round_metrics.tool_text_extracted_urls = list(dict.fromkeys(returned_urls))
         round_metrics.cumulative_unique_urls = len(before | set(normalized))
         round_metrics.cumulative_unique_domains = len(before_domains | set(domains))
         round_metrics.round_latency_ms = latency_ms
 
-    async def finalize(self, final_report: str | None, source_urls: list[str], session_id: str | None = None, *, status: str | None = None, failure: dict | None = None) -> None:
+    async def finalize(
+        self,
+        final_report: str | None,
+        source_urls: list[str],
+        session_id: str | None = None,
+        *,
+        status: str | None = None,
+        failure: dict | None = None,
+    ) -> None:
         """Freeze one terminal snapshot and retry persistence without changing it."""
         async with self._finalize_lock:
             if self._finished:
@@ -321,7 +398,9 @@ class ResearchMetrics(ObservationMixin):
             if self._terminal_snapshot is None:
                 self.final_report = final_report
                 self.source_urls = list(dict.fromkeys(source_urls))
-                self.status = status or ("incomplete" if self.incomplete else "completed")
+                self.status = status or (
+                    "incomplete" if self.incomplete else "completed"
+                )
                 self.failure = failure or {}
                 if self.status == "failed":
                     self.incomplete = True
@@ -336,13 +415,34 @@ class ResearchMetrics(ObservationMixin):
                             Evidence,
                             task_attempt_evidence,
                         )
+
                         async with database_session() as database:
-                            hashes = (await database.scalars(select(Evidence.content_hash).where(Evidence.session_id == uuid.UUID(str(session_id))))).all()
-                            self.persisted_association_count = await database.scalar(select(func.count()).select_from(task_attempt_evidence).join(Evidence).where(Evidence.session_id == uuid.UUID(str(session_id))))
+                            hashes = (
+                                await database.scalars(
+                                    select(Evidence.content_hash).where(
+                                        Evidence.session_id
+                                        == uuid.UUID(str(session_id))
+                                    )
+                                )
+                            ).all()
+                            self.persisted_association_count = await database.scalar(
+                                select(func.count())
+                                .select_from(task_attempt_evidence)
+                                .join(Evidence)
+                                .where(
+                                    Evidence.session_id == uuid.UUID(str(session_id))
+                                )
+                            )
                         self.persisted_evidence_count = len(hashes)
-                        self.persisted_hash_duplicates = sum(count - 1 for count in Counter(value for value in hashes if value).values())
+                        self.persisted_hash_duplicates = sum(
+                            count - 1
+                            for count in Counter(
+                                value for value in hashes if value
+                            ).values()
+                        )
                 except Exception as error:
                     from agent_research_lab.observability import error_facts
+
                     self.failure["evidence_counts_error"] = error_facts(error)
                 async with self._lock:
                     record = self.to_record()
@@ -354,9 +454,13 @@ class ResearchMetrics(ObservationMixin):
                 path = Path(os.getenv("AGENTLAB_METRICS_DIR", "eval/results"))
                 path.mkdir(parents=True, exist_ok=True)
                 target = path / f"{self.run_id}.jsonl"
-                fd, tmp = tempfile.mkstemp(prefix=".metrics-", suffix=".jsonl", dir=path)
+                fd, tmp = tempfile.mkstemp(
+                    prefix=".metrics-", suffix=".jsonl", dir=path
+                )
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-                    fh.write(json.dumps(self._terminal_snapshot, ensure_ascii=False) + "\n")
+                    fh.write(
+                        json.dumps(self._terminal_snapshot, ensure_ascii=False) + "\n"
+                    )
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, target)
@@ -364,6 +468,7 @@ class ResearchMetrics(ObservationMixin):
                 _collectors.pop(self.run_id, None)
             except Exception as error:
                 from agent_research_lab.observability import error_facts
+
                 logger.warning("metrics persistence failed: %s", error_facts(error))
             finally:
                 if tmp and os.path.exists(tmp):
@@ -373,6 +478,35 @@ class ResearchMetrics(ObservationMixin):
         """Create a machine-readable metrics record without report body."""
         if self._terminal_snapshot is not None:
             return copy.deepcopy(self._terminal_snapshot)
+        llm_by_id = {
+            event.get("logical_llm_call_id"): event for event in self.llm_events
+        }
+        serialized_summaries = []
+        for summary in self.summary_events:
+            row = dict(summary)
+            linked = llm_by_id.get(row.get("logical_llm_call_id"), {})
+            row["usage"] = linked.get("usage")
+            row["usage_complete"] = bool(linked.get("usage")) and all(
+                linked.get("usage", {}).get(key) is not None
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+            row["latency_ms"] = linked.get("latency_ms")
+            serialized_summaries.append(row)
+        funnel = {
+            "tavily_raw_results": self.search.get("raw_result_count", 0),
+            "tavily_deduped_results": self.search.get("deduped_result_count", 0),
+            "summarized_results": sum(
+                row.get("outcome")
+                in {
+                    "running",
+                    "summarized",
+                    "timeout_raw_fallback",
+                    "error_raw_fallback",
+                }
+                for row in serialized_summaries
+            ),
+            "persisted_source_urls": self.persisted_evidence_count,
+        }
         return {
             "schema_version": 2,
             "status": self.status,
@@ -396,17 +530,32 @@ class ResearchMetrics(ObservationMixin):
                 "summarization_llm_calls": self.llm_calls["summarization"],
                 "provider_llm_attempts": self.provider_llm_attempts,
                 "provider_attempts_supported": False,
-                **{key: self.search[key] for key in (
-                    "search_tool_calls", "search_query_count", "search_provider_requests",
-                    "raw_result_count", "deduped_result_count", "duplicate_url_count",
-                )},
-                **(self.usage if self.token_usage_complete else dict.fromkeys(self.usage)),
+                **{
+                    key: self.search[key]
+                    for key in (
+                        "search_tool_calls",
+                        "search_query_count",
+                        "search_provider_requests",
+                        "raw_result_count",
+                        "deduped_result_count",
+                        "duplicate_url_count",
+                    )
+                },
+                **(
+                    self.usage
+                    if self.token_usage_complete
+                    else dict.fromkeys(self.usage)
+                ),
                 "token_usage_complete": self.token_usage_complete,
                 "researcher_count": len(self.tasks),
                 "task_count": len(self.tasks),
                 "total_researcher_rounds": len(self.rounds),
                 "final_report_char_count": len(self.final_report or ""),
-                "final_report_sha256": hashlib.sha256(self.final_report.encode("utf-8")).hexdigest() if self.final_report else None,
+                "final_report_sha256": hashlib.sha256(
+                    self.final_report.encode("utf-8")
+                ).hexdigest()
+                if self.final_report
+                else None,
                 "source_url_count": len(self.source_urls),
                 "unique_url_count": len(self._seen_urls),
                 "unique_domain_count": len(self._seen_domains),
@@ -415,6 +564,16 @@ class ResearchMetrics(ObservationMixin):
                 "persisted_evidence_row_count": self.persisted_evidence_count,
                 "task_attempt_evidence_association_count": self.persisted_association_count,
                 "search_result_unique_url_count": len(self._seen_urls),
+                "tavily_raw_result_count": self.search.get("raw_result_count", 0),
+                "tavily_deduped_result_count": self.search.get(
+                    "deduped_result_count", 0
+                ),
+                "summarized_result_count": sum(
+                    row.get("outcome")
+                    in {"summarized", "timeout_raw_fallback", "error_raw_fallback"}
+                    for row in self.summary_events
+                ),
+                "persisted_source_url_count": self.persisted_evidence_count,
                 "content_hash_duplicate_count": self.persisted_hash_duplicates,
             },
             "question_id": self.question_id,
@@ -424,11 +583,19 @@ class ResearchMetrics(ObservationMixin):
             "config": self.config_snapshot,
             "tasks": [task.to_dict() for task in self.tasks.values()],
             "rounds": [round_.to_dict() for round_ in self.rounds],
-            "llm_events": [{key: value for key, value in event.items() if not key.startswith("_")} for event in self.llm_events],
+            "llm_events": [
+                {key: value for key, value in event.items() if not key.startswith("_")}
+                for event in self.llm_events
+            ],
             "result_events": self.result_events,
-            "summary_events": self.summary_events,
+            "summary_events": serialized_summaries,
             "search_tool_events": self.tool_events,
-            "metric_semantics": {"evidence_count": "Session-level normalized URLs extracted from tool text; not Tavily result count", "content_hash_duplicate_count": "database aggregate research-note hashes; not webpage duplicates", "novelty": "per Task/Attempt unique search-result URLs and hostnames"},
+            "metric_semantics": {
+                "evidence_count": "Session-level normalized URLs extracted from tool text; not Tavily result count",
+                "content_hash_duplicate_count": "database aggregate research-note hashes; not webpage duplicates",
+                "novelty": "per Task/Attempt unique search-result URLs and hostnames",
+            },
+            "result_processing_funnel": funnel,
             "search_request_events": self.search_request_events,
         }
 
@@ -453,7 +620,9 @@ class TaskMetrics:
         self.search_provider_requests = 0
         self.raw_search_result_count = 0
         self.duplicate_url_count = 0
-        self.usage: dict[str, int | None] = dict.fromkeys(("prompt_tokens", "completion_tokens", "total_tokens"))
+        self.usage: dict[str, int | None] = dict.fromkeys(
+            ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
         self.token_usage_complete = True
         self.status = "running"
         self.attempt_no: int | None = None
@@ -591,7 +760,9 @@ async def instrument_llm(invoke, role: str, *args, **kwargs):
     original_config = kwargs.get("config")
     if isinstance(original_config, dict):
         invocation_config = dict(original_config)
-        invocation_config["callbacks"] = list(original_config.get("callbacks") or []) + [observer]
+        invocation_config["callbacks"] = list(
+            original_config.get("callbacks") or []
+        ) + [observer]
     else:
         invocation_config = {"callbacks": [observer]}
     kwargs["config"] = invocation_config
@@ -608,7 +779,9 @@ async def instrument_llm(invoke, role: str, *args, **kwargs):
     except BaseException as error:
         if collector and event:
             try:
-                await collector.finish_llm(event, None, observer.usages, error, observer.model_facts)
+                await collector.finish_llm(
+                    event, None, observer.usages, error, observer.model_facts
+                )
             except Exception:
                 logger.warning("LLM observation finish failed")
         scope.reset(role_token)
@@ -616,7 +789,9 @@ async def instrument_llm(invoke, role: str, *args, **kwargs):
     scope.reset(role_token)
     if collector and event:
         try:
-            await collector.finish_llm(event, response, observer.usages, model_facts=observer.model_facts)
+            await collector.finish_llm(
+                event, response, observer.usages, model_facts=observer.model_facts
+            )
         except Exception:
             logger.warning("LLM observation finish failed")
     return response

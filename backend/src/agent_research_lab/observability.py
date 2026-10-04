@@ -78,6 +78,13 @@ class ObservationMixin:
         self.summary_events = []
         self.tool_events = []
         self.task_attempts = {}
+        self._arrival_urls: set[str] = set()
+        self._arrival_hashes: set[str] = set()
+        self._arrival_domains: set[str] = set()
+        self._task_arrival_urls: dict[str, set[str]] = {}
+        self._task_arrival_hashes: dict[str, set[str]] = {}
+        self._task_arrival_domains: dict[str, set[str]] = {}
+        self._round_domain_counts: dict[tuple[str, int | None, str], int] = {}
 
     def event_scope(self) -> dict:
         """Return a copy of strictly bound identities."""
@@ -249,6 +256,19 @@ class ObservationMixin:
         score = (
             score if isinstance(score, int | float) and math.isfinite(score) else None
         )
+        task_id = self.event_scope().get("task_id")
+        task_urls = self._task_arrival_urls.setdefault(task_id or "", set())
+        task_hashes = self._task_arrival_hashes.setdefault(task_id or "", set())
+        task_domains = self._task_arrival_domains.setdefault(task_id or "", set())
+
+        normalized = result.get("normalized_url") or normalize_url(
+            result.get("url", "")
+        )
+        raw_content = result.get("raw_content")
+        content_hash = result.get("raw_content_hash") or digest(raw_content) if isinstance(raw_content, str) else result.get("raw_content_hash")
+        domain = result.get("domain")
+        round_key = (task_id or "", self.event_scope().get("round_index"), domain or "")
+        domain_count = self._round_domain_counts.get(round_key, 0)
         event = {
             **self.event_scope(),
             "result_id": str(uuid.uuid4()),
@@ -265,9 +285,38 @@ class ObservationMixin:
             "snippet_char_count": len(result.get("content") or ""),
             "duplicate_of_result_id": representative,
             "selected_after_raw_url_dedup": representative is None,
+            "url_seen_before_in_task": normalized in task_urls if normalized else False,
+            "url_seen_before_in_research": normalized in self._arrival_urls
+            if normalized
+            else False,
+            "domain_seen_before_in_task": domain in task_domains if domain else False,
+            "domain_seen_before_in_research": domain in self._arrival_domains
+            if domain
+            else False,
+            "content_hash_seen_before_in_task": content_hash in task_hashes
+            if content_hash
+            else False,
+            "content_hash_seen_before_in_research": content_hash in self._arrival_hashes
+            if content_hash
+            else False,
+            "domain_seen_count_in_task_round": domain_count,
         }
         async with self._lock:
             self.result_events.append(event)
+            if normalized:
+                task_urls.add(normalized)
+                self._arrival_urls.add(normalized)
+            if content_hash:
+                task_hashes.add(content_hash)
+                self._arrival_hashes.add(content_hash)
+            if domain:
+                task_domains.add(domain)
+                self._arrival_domains.add(domain)
+                self._round_domain_counts[round_key] = domain_count + 1
+            from agent_research_lab.shadow_gate import shadow_trace
+
+            event["shadow_gate_mode"] = "observe_only"
+            event["shadow_decisions"] = shadow_trace(event)["policies"]
         return event
 
     async def start_summary(self, result: dict, input_text: str | None) -> dict:

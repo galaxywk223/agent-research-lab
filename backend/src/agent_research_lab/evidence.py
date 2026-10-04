@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import unicodedata
 from collections.abc import Iterable
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"')\]}]+")
 MIN_RESEARCH_BRIEF_LENGTH = 80
@@ -13,10 +15,43 @@ MIN_RESEARCH_BRIEF_LENGTH = 80
 def normalize_url(value: str) -> str | None:
     """Return a clean HTTP(S) URL, or ``None`` for non-web content."""
     candidate = value.strip().rstrip(".,;:!?，。；：！")
-    parsed = urlparse(candidate)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
-    return candidate
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+    host = hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port
+    if port and not ((parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443)):
+        host = f"{host}:{port}"
+    username = parsed.username
+    password = parsed.password
+    auth = ""
+    if username is not None:
+        auth = username
+        if password is not None:
+            auth += f":{password}"
+        auth += "@"
+    return urlunsplit((parsed.scheme.lower(), f"{auth}{host}", parsed.path, parsed.query, ""))
+
+
+def canonical_content(value: str | None) -> str | None:
+    """Normalize evidence text before hashing and snapshot storage."""
+    if value is None:
+        return None
+    normalized = unicodedata.normalize("NFC", str(value)).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized
+
+
+def content_hash(content: str | None, snippet: str | None = None) -> str | None:
+    """Return the SHA-256 hash of the canonical evidence content."""
+    canonical = canonical_content(content) or canonical_content(snippet)
+    if not canonical:
+        return None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def extract_source_urls(observations: Iterable[str]) -> list[str]:
