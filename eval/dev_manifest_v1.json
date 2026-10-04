@@ -1,0 +1,18 @@
+{
+  "dev_version": "dev-v1",
+  "dataset_split": "development",
+  "purpose": "strategy_development",
+  "seed": 20261004,
+  "question_count": 5,
+  "questions_sha256": "bdd48cb7cc831d1b973647e816c541087ae53d5c3f26542f2daada936dd0dcd9",
+  "created_at": "2026-10-04T07:26:41.258937+00:00",
+  "baseline_config_sha256": "77800b109e501da893f828a698b651e829cb23a72db2c5ac25863f6e45d7ef28",
+  "judge_config_sha256": "f20076564ce3f7880b3d54ac438041d002d285247c02129862a61d4a400ef9cf",
+  "holdout_questions_sha256_guard": "9511f18eb766976a115d35768f56ee6910172458e69507082a42da867883bf76",
+  "judge_prompt_hash": {
+    "coverage": "41ff016360f8300772a529a1510563455118fffb5253708b76a5939254fae31c",
+    "quality": "8c424c3948e3e93dc32a17abc0989dea128035c26933a622e2c014c734e4cb91",
+    "pairwise": "5087aa47496ceb5845e1c0a0b392debd69fc18de8d1b7f26aadaccf46e32bfa5"
+  },
+  "rubric_hash": "7349afe0af4efedca51cc31bf4ebbe9b68859cd9495d7cf06295a7f64dcfb782"
+}

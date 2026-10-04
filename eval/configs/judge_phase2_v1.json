@@ -1,0 +1,39 @@
+{
+  "version": "phase2-judge-v1",
+  "environment_values": {
+    "EVAL_JUDGE_MODEL": "openai:glm-5.3",
+    "EVAL_JUDGE_STRUCTURED_METHOD": "json_schema",
+    "EVAL_JUDGE_REASONING_EFFORT": "low"
+  },
+  "model": "openai:glm-5.3",
+  "structured_method": "json_schema",
+  "reasoning_effort": "low",
+  "temperature_requested": 0,
+  "temperature_effective": "unknown",
+  "max_tokens": 8192,
+  "max_retries": 0,
+  "use_responses_api": false,
+  "enable_thinking": "omitted",
+  "include_raw": true,
+  "input_contract": "output_json_schema supplied uniformly; research notes read from business.evidence_packet",
+  "fixture_sha256": "23d98ca6d4555d1bb08f5015146a9ee1768fd64bc26f0f2e75cd2ba239c3cdb3",
+  "schema_sha256": {
+    "coverage": "b24c5cbf98a27f1b1a0355fd2b3db27c83c8d02f68a4403664364598495157fd",
+    "quality": "de464660f64ed83382d101301dccdff8e3b95fae9b5e5bf6876757c834674bef",
+    "pairwise": "b15561890bdf38c2a07028de36d2190586228bace8dc4f43f58bc78872adbe89"
+  },
+  "prompt_sha256": {
+    "coverage": "41ff016360f8300772a529a1510563455118fffb5253708b76a5939254fae31c",
+    "quality": "8c424c3948e3e93dc32a17abc0989dea128035c26933a622e2c014c734e4cb91",
+    "pairwise": "5087aa47496ceb5845e1c0a0b392debd69fc18de8d1b7f26aadaccf46e32bfa5"
+  },
+  "rubric_sha256": "7349afe0af4efedca51cc31bf4ebbe9b68859cd9495d7cf06295a7f64dcfb782",
+  "dependency_versions": {
+    "langchain": "1.3.9",
+    "langchain-core": "1.4.8",
+    "langchain-openai": "1.1.14",
+    "openai": "2.32.0",
+    "pydantic": "2.11.5"
+  },
+  "acceptance_config_sha256": "5ebd597e9619849c7c915b5d15a68aab1fb455b9f32e2d5f352a70a619efefbb"
+}

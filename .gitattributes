@@ -1,0 +1,7 @@
+# Frozen evaluation assets use byte-stable UTF-8/LF across Windows checkouts.
+eval/*questions*.jsonl text eol=lf
+eval/*manifest*.json text eol=lf
+eval/configs/*.json text eol=lf
+eval/prompts/*.txt text eol=lf
+eval/rubric_v1.json text eol=lf
+eval/protocol_v1.json text eol=lf
