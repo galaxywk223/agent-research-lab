@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
@@ -30,12 +31,26 @@ from mcp import McpError
 from tavily import AsyncTavilyClient
 
 from agent_research_lab.configuration import Configuration, SearchAPI
+from agent_research_lab.evidence import content_hash
+from agent_research_lab.metrics import current_metrics, instrument_llm
+from agent_research_lab.observability import bind, error_facts, scope
 from agent_research_lab.prompts import summarize_webpage_prompt
+from agent_research_lab.providers import fake_search_tool, provider_mode
 from agent_research_lab.state import ResearchComplete, Summary
+
 
 ##########################
 # Tavily Search Tool Utils
 ##########################
+async def observe(method, *args):
+    """Run an observation without changing provider or tool behavior."""
+    try:
+        return await method(*args)
+    except Exception:
+        logging.warning("Search observation failed")
+        return None
+
+
 TAVILY_SEARCH_DESCRIPTION = (
     "A search engine optimized for comprehensive, accurate, and trusted results. "
     "Useful for when you need to answer questions about current events."
@@ -58,82 +73,106 @@ async def tavily_search(
     Returns:
         Formatted string containing summarized search results
     """
-    # Step 1: Execute search queries asynchronously
-    search_results = await tavily_search_async(
-        queries,
-        max_results=max_results,
-        topic=topic,
-        include_raw_content=True,
-        config=config
-    )
-    
-    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
-    unique_results = {}
-    for response in search_results:
-        for result in response['results']:
-            url = result['url']
-            if url not in unique_results:
-                unique_results[url] = {**result, "query": response['query']}
-    
-    # Step 3: Set up the summarization model with configuration
-    configurable = Configuration.from_runnable_config(config)
-    
-    # Character limit to stay within model token limits (configurable)
-    max_char_to_include = configurable.max_content_length
-    
-    # Initialize summarization model with retry logic
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
-        tags=["langsmith:nostream"]
-    ).with_structured_output(Summary).with_retry(
-        stop_after_attempt=configurable.max_structured_output_retries
-    )
-    
-    # Step 4: Create summarization tasks (skip empty content)
-    async def noop():
-        """No-op function for results without raw content."""
-        return None
-    
-    summarization_tasks = [
-        noop() if not result.get("raw_content") 
-        else summarize_webpage(
-            summarization_model, 
-            result['raw_content'][:max_char_to_include]
+    metrics = current_metrics()
+    tool_event = await observe(metrics.start_search_tool, queries) if metrics else None
+    token = bind(search_tool_call_id=tool_event["search_tool_call_id"] if tool_event else None, query_occurrences=tool_event["queries"] if tool_event else [])
+    try:
+        # Step 1: Execute search queries asynchronously
+        search_results = await tavily_search_async(
+            queries,
+            max_results=max_results,
+            topic=topic,
+            include_raw_content=True,
+            config=config
         )
-        for result in unique_results.values()
-    ]
+
+        # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
+        unique_results = {}
+        representative_events = {}
+        for query_index, response in enumerate(search_results):
+            for rank, result in enumerate(response['results'], 1):
+                url = result['url']
+                query_event = tool_event["queries"][query_index] if tool_event else {}
+                representative = representative_events.get(url)
+                result_event = await observe(metrics.result_observation, result, query_event, rank, representative["result_id"] if representative else None) if metrics else None
+                if url not in unique_results:
+                    representative_events[url] = result_event
+                    unique_results[url] = {**result, "query": response['query']}
+        metrics = current_metrics()
+        if metrics:
+            try:
+                await metrics.search_event(
+                    queries,
+                    sum(len(response.get("results", [])) for response in search_results),
+                    len(unique_results),
+                    list(unique_results),
+                    [hash_value for result in unique_results.values() if (hash_value := content_hash(result.get("raw_content"), result.get("content")))],
+                )
+            except Exception as exc:
+                logging.warning("Search metrics failed: %s", exc)
+
+        # Step 3: Set up the summarization model with configuration
+        configurable = Configuration.from_runnable_config(config)
+
+        # Character limit to stay within model token limits (configurable)
+        max_char_to_include = configurable.max_content_length
+
+        # Initialize summarization model with retry logic
+        model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+        summarization_model = init_chat_model(
+            model=configurable.summarization_model,
+            max_tokens=configurable.summarization_model_max_tokens,
+            api_key=model_api_key,
+            tags=["langsmith:nostream"]
+        ).with_structured_output(Summary).with_retry(
+            stop_after_attempt=configurable.max_structured_output_retries
+        )
+
+        # Step 4: Create summarization tasks (skip empty content)
+        async def noop():
+            """No-op function for results without raw content."""
+            return None
     
-    # Step 5: Execute all summarization tasks in parallel
-    summaries = await asyncio.gather(*summarization_tasks)
-    
-    # Step 6: Combine results with their summaries
-    summarized_results = {
-        url: {
-            'title': result['title'], 
-            'content': result['content'] if summary is None else summary
+        async def observed_summary(url, result):
+            text = result.get("raw_content")
+            summary_event = await observe(metrics.start_summary, representative_events[url], text[:max_char_to_include] if text else None) if metrics and representative_events.get(url) else None
+            token = bind(**{key: summary_event[key] for key in ("summary_call_id", "result_id", "query_id")} if summary_event else {})
+            try:
+                return await noop() if not text else await summarize_webpage(summarization_model, text[:max_char_to_include])
+            finally:
+                scope.reset(token)
+        summarization_tasks = [observed_summary(url, result) for url, result in unique_results.items()]
+
+        # Step 5: Execute all summarization tasks in parallel
+        summaries = await asyncio.gather(*summarization_tasks)
+
+        # Step 6: Combine results with their summaries
+        summarized_results = {
+            url: {
+                'title': result['title'],
+                'content': result['content'] if summary is None else summary
+            }
+            for url, result, summary in zip(
+                unique_results.keys(),
+                unique_results.values(),
+                summaries
+            )
         }
-        for url, result, summary in zip(
-            unique_results.keys(), 
-            unique_results.values(), 
-            summaries
-        )
-    }
     
-    # Step 7: Format the final output
-    if not summarized_results:
-        return "No valid search results found. Please try different search queries or use a different search API."
+        # Step 7: Format the final output
+        if not summarized_results:
+            return "No valid search results found. Please try different search queries or use a different search API."
     
-    formatted_output = "Search results: \n\n"
-    for i, (url, result) in enumerate(summarized_results.items()):
-        formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
-        formatted_output += f"URL: {url}\n\n"
-        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
-        formatted_output += "\n\n" + "-" * 80 + "\n"
+        formatted_output = "Search results: \n\n"
+        for i, (url, result) in enumerate(summarized_results.items()):
+            formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
+            formatted_output += f"URL: {url}\n\n"
+            formatted_output += f"SUMMARY:\n{result['content']}\n\n"
+            formatted_output += "\n\n" + "-" * 80 + "\n"
     
-    return formatted_output
+        return formatted_output
+    finally:
+        scope.reset(token)
 
 async def tavily_search_async(
     search_queries, 
@@ -158,16 +197,28 @@ async def tavily_search_async(
     tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
     
     # Create search tasks for parallel execution
-    search_tasks = [
-        tavily_client.search(
-            query,
-            max_results=max_results,
-            include_raw_content=include_raw_content,
-            topic=topic
-        )
-        for query in search_queries
-    ]
-    
+    async def search_one(index, query: str):
+        started = time.perf_counter()
+        metrics = current_metrics()
+        occurrences = scope.get().get("query_occurrences") or []
+        identity = occurrences[index] if occurrences else {"query": query, "query_id": None}
+        token = bind(query_id=identity["query_id"])
+        request_event = await observe(metrics.start_search_request, identity) if metrics and occurrences else None
+        try:
+            result = await tavily_client.search(query, max_results=max_results, include_raw_content=include_raw_content, topic=topic)
+            if request_event:
+                request_event.update(status="success", result_count=len(result.get("results", [])), latency_ms=(time.perf_counter()-started)*1000)
+            elif metrics:
+                await observe(metrics.provider_request, query, (time.perf_counter()-started)*1000, len(result.get("results", [])))
+            return result
+        except BaseException as error:
+            if request_event:
+                request_event.update(status="error", **error_facts(error), latency_ms=(time.perf_counter()-started)*1000)
+            raise
+        finally:
+            scope.reset(token)
+    search_tasks = [search_one(index, query) for index, query in enumerate(search_queries)]
+
     # Execute all search queries in parallel and return results
     search_results = await asyncio.gather(*search_tasks)
     return search_results
@@ -191,7 +242,7 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         
         # Execute summarization with timeout to prevent hanging
         summary = await asyncio.wait_for(
-            model.ainvoke([HumanMessage(content=prompt_content)]),
+            instrument_llm(model.ainvoke, "summarization", [HumanMessage(content=prompt_content)]),
             timeout=60.0  # 60 second timeout for summarization
         )
         
@@ -201,15 +252,24 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
             f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
         )
         
+        metrics = current_metrics()
+        if metrics:
+            await observe(metrics.finish_summary, formatted_summary, "summarized")
         return formatted_summary
         
     except asyncio.TimeoutError:
         # Timeout during summarization - return original content
         logging.warning("Summarization timed out after 60 seconds, returning original content")
+        metrics = current_metrics()
+        if metrics:
+            await observe(metrics.finish_summary, webpage_content, "timeout_raw_fallback")
         return webpage_content
     except Exception as e:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
+        metrics = current_metrics()
+        if metrics:
+            await observe(metrics.finish_summary, webpage_content, "error_raw_fallback")
         return webpage_content
 
 ##########################
@@ -537,6 +597,8 @@ async def get_search_tool(search_api: SearchAPI):
     Returns:
         List of configured search tool objects for the specified provider
     """
+    if provider_mode() == "fake":
+        return [fake_search_tool()]
     if search_api == SearchAPI.ANTHROPIC:
         # Anthropic's native web search with usage limits
         return [{

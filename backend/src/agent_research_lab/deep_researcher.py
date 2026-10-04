@@ -1,9 +1,10 @@
 """Main LangGraph implementation for the Deep Research agent."""
 
 import asyncio
+import time
+import uuid
 from typing import Literal
 
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -14,6 +15,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import get_runtime
 from langgraph.types import Command
 
 from agent_research_lab.configuration import (
@@ -26,6 +28,23 @@ from agent_research_lab.evidence import (
     extract_source_urls,
     is_valid_research_brief,
 )
+from agent_research_lab.failure import FailureObserver, question_id, register_business
+from agent_research_lab.metrics import (
+    _attempt,
+    _round,
+    activate_run,
+    begin_research,
+    bind_round,
+    bind_task,
+    config_snapshot,
+    instrument_llm,
+    metrics_for,
+    reset_round,
+    reset_task,
+)
+from agent_research_lab.models import SessionRunStatus, SessionStatus
+from agent_research_lab.observability import bind as bind_observation
+from agent_research_lab.observability import error_facts, redact, scope
 from agent_research_lab.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
@@ -35,6 +54,8 @@ from agent_research_lab.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from agent_research_lab.providers import create_chat_model
+from agent_research_lab.repository import ResearchRepository
 from agent_research_lab.state import (
     AgentInputState,
     AgentState,
@@ -60,9 +81,69 @@ from agent_research_lab.utils import (
 )
 
 # Initialize a configurable model that we will use throughout the agent
-configurable_model = init_chat_model(
+configurable_model = create_chat_model(
     configurable_fields=("model", "max_tokens", "api_key"),
 )
+
+repository = ResearchRepository()
+
+
+def _execution_ids(state: AgentState | SupervisorState | ResearcherState, config: RunnableConfig) -> tuple[str, str]:
+    """Resolve the current Thread and Run identifiers without forcing UUID types."""
+    thread_id = str(config.get("configurable", {}).get("thread_id") or "standalone")
+    runtime_run_id = None
+    try:
+        runtime_run_id = get_runtime().execution_info.run_id
+    except (AttributeError, RuntimeError, KeyError):
+        runtime_run_id = None
+    run_id = runtime_run_id or config.get("run_id") or state.get("run_id") or str(uuid.uuid4())
+    return thread_id, str(run_id)
+
+
+def _research_context(state: AgentState, config: RunnableConfig) -> tuple[str, bool, bool]:
+    """Resolve explicit new/continuation Research context at the graph boundary."""
+    configurable = config.get("configurable", {})
+    continuation = bool(configurable.get("continuation", state.get("continuation", False)))
+    new_research = bool(configurable.get("new_research", state.get("new_research", False)))
+    research_id = configurable.get("research_id") or state.get("research_id")
+    if continuation:
+        if not research_id:
+            raise ValueError("Continuation requires research_id in checkpoint state or invocation context")
+        return str(research_id), True, False
+    if new_research:
+        return str(uuid.uuid4()), False, True
+    if research_id:
+        if str(configurable.get("run_id", "")) == str(state.get("run_id", "")):
+            return str(research_id), False, False
+        raise ValueError("Research context is ambiguous; specify new_research=true or continuation=true")
+    return str(uuid.uuid4()), False, True
+
+
+async def _ensure_session(state: AgentState, config: RunnableConfig):
+    """Create or reuse the business Session for the current LangGraph Run."""
+    thread_id, run_id = _execution_ids(state, config)
+    research_id, continuation, _ = _research_context(state, config)
+    user_query = get_buffer_string(state.get("messages", []))
+    session = await repository.create_research_session(
+        research_id=research_id,
+        run_id=run_id,
+        thread_id=thread_id,
+        user_query=user_query,
+        continuation=continuation,
+        checkpoint_id=config.get("configurable", {}).get("checkpoint_id"),
+        config=dict(config.get("configurable", {})),
+    )
+    register_business(run_id, str(session.id))
+    return thread_id, run_id, research_id, session
+
+
+async def _finish_run(state: AgentState, *, run_status: SessionRunStatus, session_status: SessionStatus, final_report: str | None = None) -> None:
+    """Finish the current Run while preserving historical session_runs."""
+    run_id = state.get("run_id")
+    if run_id:
+        await repository.finish_session_run(run_id, status=run_status, session_status=session_status)
+        if final_report is not None and state.get("session_id"):
+            await repository.update_session(uuid.UUID(str(state["session_id"])), status=session_status, final_report=final_report)
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
@@ -77,11 +158,21 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     Returns:
         Command to either end with a clarifying question or proceed to research brief
     """
+    metrics_started = time.perf_counter()
+    _, run_id, research_id, session = await _ensure_session(state, config)
+    if metrics_for(run_id) is None:
+        begin_research(research_id, run_id, _execution_ids(state, config)[0], config_snapshot(config))._started = metrics_started
+    else:
+        activate_run(run_id)
+    if metrics_for(run_id):
+        metrics_for(run_id).question_id = question_id()
+    session_update = {"run_id": run_id, "research_id": research_id, "session_id": str(session.id)}
+
     # Step 1: Check if clarification is enabled in configuration
     configurable = Configuration.from_runnable_config(config)
     if not configurable.allow_clarification:
         # Skip clarification step and proceed directly to research
-        return Command(goto="write_research_brief")
+        return Command(goto="write_research_brief", update=session_update)
     
     # Step 2: Prepare the model for structured clarification analysis
     messages = state["messages"]
@@ -105,20 +196,24 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         messages=get_buffer_string(messages), 
         date=get_today_str()
     )
-    response = await clarification_model.ainvoke([HumanMessage(content=prompt_content)])
+    response = await instrument_llm(clarification_model.ainvoke, "clarification", [HumanMessage(content=prompt_content)])
     
     # Step 4: Route based on clarification analysis
     if response.need_clarification:
+        metrics = metrics_for(run_id)
+        if metrics:
+            metrics.incomplete = True
+            await metrics.finalize(None, [], str(state.get("session_id")) if state.get("session_id") else None)
         # End with clarifying question for user
         return Command(
             goto=END, 
-            update={"messages": [AIMessage(content=response.question)]}
+            update={"messages": [AIMessage(content=response.question)], **session_update}
         )
     else:
         # Proceed to research with verification message
         return Command(
             goto="write_research_brief", 
-            update={"messages": [AIMessage(content=response.verification)]}
+            update={"messages": [AIMessage(content=response.verification)], **session_update}
         )
 
 
@@ -136,6 +231,12 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     Returns:
         Command to proceed to research supervisor with initialized context
     """
+    activate_run(state.get("run_id"))
+    if state.get("session_id"):
+        _, _, _, session = await _ensure_session(state, config)
+    else:
+        _, _, _, session = await _ensure_session(state, config)
+
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
@@ -158,12 +259,18 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     )
-    response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
+    response = await instrument_llm(research_model.ainvoke, "research_brief", [HumanMessage(content=prompt_content)])
 
     if not is_valid_research_brief(response.research_brief):
+        metrics = metrics_for(_execution_ids(state, config)[1])
+        if metrics:
+            metrics.incomplete = True
+            await metrics.finalize(None, [], str(state.get("session_id")) if state.get("session_id") else None)
+        await _finish_run({"run_id": _execution_ids(state, config)[1], "session_id": str(session.id)}, run_status=SessionRunStatus.FAILED, session_status=SessionStatus.FAILED)
         raise InvalidResearchBriefError(
             f"Research brief must contain at least {MIN_RESEARCH_BRIEF_LENGTH} characters."
         )
+    await repository.update_session(session.id, status=SessionStatus.RUNNING, research_brief=response.research_brief)
     
     # Step 3: Initialize supervisor with research brief and instructions
     supervisor_system_prompt = lead_researcher_prompt.format(
@@ -176,6 +283,9 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         goto="research_supervisor", 
         update={
             "research_brief": response.research_brief,
+            "run_id": _execution_ids(state, config)[1],
+            "session_id": str(session.id),
+            "research_id": session.research_id,
             "supervisor_messages": {
                 "type": "override",
                 "value": [
@@ -201,6 +311,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     Returns:
         Command to proceed to supervisor_tools for tool execution
     """
+    activate_run(state.get("run_id"))
     # Step 1: Configure the supervisor model with available tools
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
@@ -223,7 +334,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     
     # Step 2: Generate supervisor response based on current context
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
+    response = await instrument_llm(research_model.ainvoke, "supervisor", supervisor_messages)
     
     # Step 3: Update state and proceed to tool execution
     return Command(
@@ -233,6 +344,92 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
             "research_iterations": state.get("research_iterations", 0) + 1
         }
     )
+
+
+async def _run_research_task(
+    *,
+    state: SupervisorState,
+    config: RunnableConfig,
+    tool_call: dict,
+    task_order: int,
+) -> dict:
+    """Run one idempotent research Task and persist its Attempt result."""
+    arguments = dict(tool_call.get("args", {}))
+    topic = str(arguments.get("research_topic", "")).strip()
+    session_id = state.get("session_id")
+    if not session_id:
+        raise RuntimeError("Supervisor state is missing session_id")
+    task = await repository.get_or_create_task(
+        session_id=uuid.UUID(str(session_id)),
+        topic=topic,
+        task_order=task_order,
+        arguments=arguments,
+    )
+    metrics = metrics_for(state.get("run_id"))
+    task_metrics = metrics.task(str(task.id), topic) if metrics else None
+    claim = await repository.create_attempt_locked(task.id, run_id=state.get("run_id"))
+    if claim.completed_attempt:
+        if task_metrics:
+            task_metrics.attempt_no = claim.completed_attempt.attempt_no
+            task_metrics.finish("completed")
+        return await repository.get_attempt_result(claim.completed_attempt.id)
+    if claim.already_running:
+        return {
+            "compressed_research": "Research task is already running; no duplicate provider call was started.",
+            "raw_notes": [],
+            "source_urls": [],
+            "already_running": True,
+        }
+    if not claim.attempt:
+        raise RuntimeError(f"Unable to acquire attempt for task {task.id}")
+
+    attempt_id = str(claim.attempt.id)
+    _attempt.set(attempt_id)
+    if task_metrics:
+        task_metrics.attempt_no = claim.attempt.attempt_no
+    try:
+        await repository.refresh_attempt_lease(claim.attempt.id)
+        observation = await researcher_subgraph.ainvoke(
+            {
+                "researcher_messages": [HumanMessage(content=topic)],
+                "research_topic": topic,
+                "run_id": state.get("run_id"),
+                "session_id": session_id,
+                "task_id": str(task.id),
+                "attempt_id": attempt_id,
+            },
+            config,
+        )
+        compressed = str(observation.get("compressed_research", ""))
+        raw_notes = "\n".join(str(item) for item in observation.get("raw_notes", []))
+        source_urls = list(dict.fromkeys(observation.get("source_urls", [])))
+        if compressed.startswith("Error synthesizing research report:"):
+            raise RuntimeError(compressed)
+        evidence = [{"url": url, "content": raw_notes, "snippet": compressed} for url in source_urls]
+        await repository.complete_attempt_with_evidence(
+            attempt_id=claim.attempt.id,
+            compressed_research=compressed,
+            raw_notes=raw_notes,
+            observations=evidence,
+        )
+        if task_metrics:
+            task_metrics.finish("completed")
+            try:
+                await metrics.evidence_event(evidence)
+            except Exception:
+                pass
+        return observation
+    except Exception as error:
+        await repository.fail_attempt(claim.attempt.id, redact(str(error)))
+        if task_metrics:
+            task_metrics.finish("failed")
+        return {
+            "compressed_research": f"Error executing research task: {error}",
+            "raw_notes": [],
+            "source_urls": [],
+            "failed": True,
+        }
+
 
 async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
     """Execute tools called by the supervisor, including research delegation and strategic thinking.
@@ -298,68 +495,42 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     ]
     
     if conduct_research_calls:
-        try:
-            # Limit concurrent research units to prevent resource exhaustion
-            allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
-            overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
-            
-            # Execute research tasks in parallel
-            research_tasks = [
-                researcher_subgraph.ainvoke({
-                    "researcher_messages": [
-                        HumanMessage(content=tool_call["args"]["research_topic"])
-                    ],
-                    "research_topic": tool_call["args"]["research_topic"]
-                }, config) 
-                for tool_call in allowed_conduct_research_calls
-            ]
-            
-            tool_results = await asyncio.gather(*research_tasks)
-            
-            # Create tool messages with research results
-            for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
-                all_tool_messages.append(ToolMessage(
-                    content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
-                    name=tool_call["name"],
-                    tool_call_id=tool_call["id"]
-                ))
-            
-            # Handle overflow research calls with error messages
-            for overflow_call in overflow_conduct_research_calls:
-                all_tool_messages.append(ToolMessage(
-                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
-                    name="ConductResearch",
-                    tool_call_id=overflow_call["id"]
-                ))
-            
-            # Aggregate raw notes from all research results
-            raw_notes_concat = "\n".join([
-                "\n".join(observation.get("raw_notes", [])) 
-                for observation in tool_results
-            ])
-            
-            if raw_notes_concat:
-                update_payload["raw_notes"] = [raw_notes_concat]
+        # Limit concurrent research units to prevent resource exhaustion.
+        allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
+        overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
+        research_tasks = [
+            _run_research_task(state=state, config=config, tool_call=tool_call, task_order=index)
+            for index, tool_call in enumerate(allowed_conduct_research_calls)
+        ]
+        tool_results = await asyncio.gather(*research_tasks, return_exceptions=True)
 
-            source_urls = [
-                url
-                for observation in tool_results
-                for url in observation.get("source_urls", [])
-            ]
-            if source_urls:
-                update_payload["source_urls"] = list(dict.fromkeys(source_urls))
-                
-        except Exception as e:
-            # Handle research execution errors
-            if is_token_limit_exceeded(e, configurable.research_model) or True:
-                # Token limit exceeded or other error - end research phase
-                return Command(
-                    goto=END,
-                    update={
-                        "notes": get_notes_from_tool_calls(supervisor_messages),
-                        "research_brief": state.get("research_brief", "")
-                    }
-                )
+        normalized_results = []
+        for result in tool_results:
+            if isinstance(result, Exception):
+                normalized_results.append({"compressed_research": f"Error executing research task: {result}", "raw_notes": [], "source_urls": [], "failed": True})
+            else:
+                normalized_results.append(result)
+
+        for observation, tool_call in zip(normalized_results, allowed_conduct_research_calls):
+            all_tool_messages.append(ToolMessage(
+                content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"],
+            ))
+
+        for overflow_call in overflow_conduct_research_calls:
+            all_tool_messages.append(ToolMessage(
+                content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
+                name="ConductResearch",
+                tool_call_id=overflow_call["id"],
+            ))
+
+        raw_notes_concat = "\n".join("\n".join(observation.get("raw_notes", [])) for observation in normalized_results)
+        if raw_notes_concat:
+            update_payload["raw_notes"] = [raw_notes_concat]
+        source_urls = [url for observation in normalized_results for url in observation.get("source_urls", [])]
+        if source_urls:
+            update_payload["source_urls"] = list(dict.fromkeys(source_urls))
     
     # Step 3: Return command with all tool results
     update_payload["supervisor_messages"] = all_tool_messages
@@ -396,6 +567,10 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     Returns:
         Command to proceed to researcher_tools for tool execution
     """
+    metrics = activate_run(state.get("run_id"))
+    _attempt.set(str(state.get("attempt_id")) if state.get("attempt_id") else None)
+    _round.set(state.get("tool_call_iterations", 0) + 1)
+    task_token = bind_task(str(state.get("task_id"))) if metrics and state.get("task_id") else None
     # Step 1: Load configuration and validate tool availability
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
@@ -432,7 +607,16 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Step 3: Generate researcher response with system context
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await research_model.ainvoke(messages)
+    if state.get("attempt_id"):
+        await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
+    started = time.perf_counter()
+    response = await instrument_llm(research_model.ainvoke, "researcher", messages)
+    if metrics and state.get("task_id"):
+        metrics.task(str(state["task_id"])).round_start = started
+    if task_token:
+        reset_task(task_token)
+    if state.get("attempt_id"):
+        await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
     
     # Step 4: Update state and proceed to tool execution
     return Command(
@@ -468,6 +652,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     Returns:
         Command to either continue research loop or proceed to compression
     """
+    metrics = activate_run(state.get("run_id"))
+    task_token = bind_task(str(state.get("task_id"))) if metrics and state.get("task_id") else None
     # Step 1: Extract current state and check early exit conditions
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
@@ -481,6 +667,11 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     )
     
     if not has_tool_calls and not has_native_search:
+        if metrics and state.get("task_id"):
+            bucket = metrics.task(str(state["task_id"]))
+            await metrics.add_round(str(state["task_id"]), state.get("tool_call_iterations", 0), [], [], [], (time.perf_counter() - getattr(bucket, "round_start", time.perf_counter())) * 1000)
+        if task_token:
+            reset_task(task_token)
         return Command(goto="compress_research")
     
     # Step 2: Handle other tool calls (search, MCP tools, etc.)
@@ -492,11 +683,23 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     
     # Execute all tool calls in parallel
     tool_calls = most_recent_message.tool_calls
-    tool_execution_tasks = [
-        execute_tool_safely(tools_by_name[tool_call["name"]], tool_call["args"], config) 
-        for tool_call in tool_calls
-    ]
+    async def observed_tool(call):
+        metrics = metrics_for(state.get("run_id"))
+        parent_id = metrics.parent_llm_id(str(state.get("task_id")), state.get("tool_call_iterations", 0), call.get("id")) if metrics else None
+        token = bind_observation(agent_tool_call_id=call.get("id"), parent_logical_llm_call_id=parent_id)
+        try:
+            return await execute_tool_safely(tools_by_name[call["name"]], call["args"], config)
+        finally:
+            scope.reset(token)
+    tool_execution_tasks = [observed_tool(call) for call in tool_calls]
+    if state.get("attempt_id"):
+        await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
+    round_token = bind_round(state.get("tool_call_iterations", 0)) if metrics else None
     observations = await asyncio.gather(*tool_execution_tasks)
+    if round_token:
+        reset_round(round_token)
+    if state.get("attempt_id"):
+        await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
     
     # Create tool messages from execution results
     tool_outputs = [
@@ -514,6 +717,18 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         if tool_call["name"] != "think_tool"
     ]
     source_urls = extract_source_urls(search_observations)
+    if metrics and state.get("task_id"):
+        bucket = metrics.task(str(state["task_id"]))
+        queries = [
+            str(query)
+            for call in tool_calls
+            if call["name"] in {"tavily_search", "web_search"}
+            for query in (call.get("args", {}).get("queries") or [call.get("args", {}).get("query")])
+            if query
+        ]
+        await metrics.add_round(str(state["task_id"]), state.get("tool_call_iterations", 0), queries, source_urls, [], (time.perf_counter() - getattr(bucket, "round_start", time.perf_counter())) * 1000)
+    if task_token:
+        reset_task(task_token)
     
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
@@ -549,6 +764,8 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     Returns:
         Dictionary containing compressed research summary and raw notes
     """
+    metrics = activate_run(state.get("run_id"))
+    task_token = bind_task(str(state.get("task_id"))) if metrics and state.get("task_id") else None
     # Step 1: Configure the compression model
     configurable = Configuration.from_runnable_config(config)
     synthesizer_model = configurable_model.with_config({
@@ -575,7 +792,13 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             messages = [SystemMessage(content=compression_prompt)] + researcher_messages
             
             # Execute compression
-            response = await synthesizer_model.ainvoke(messages)
+            if state.get("attempt_id"):
+                await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
+            response = await instrument_llm(synthesizer_model.ainvoke, "compression", messages)
+            if task_token:
+                reset_task(task_token)
+            if state.get("attempt_id"):
+                await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
             
             # Extract raw notes from all tool and AI messages
             raw_notes_content = "\n".join([
@@ -646,6 +869,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     Returns:
         Dictionary containing the final report and cleared state
     """
+    metrics = activate_run(state.get("run_id"))
     # Step 1: Extract research findings and prepare state cleanup
     notes = state.get("notes", [])
     source_urls = list(dict.fromkeys(state.get("source_urls", [])))
@@ -653,12 +877,22 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     findings = "\n".join(notes)
 
     if not is_valid_research_brief(state.get("research_brief")):
+        if state.get("session_id"):
+            await _finish_run(state, run_status=SessionRunStatus.FAILED, session_status=SessionStatus.FAILED)
+        if metrics:
+            metrics.incomplete = True
+            await metrics.finalize(None, [], str(state.get("session_id")) if state.get("session_id") else None, status="failed", failure={"failure_stage": "final_report", "failure_type": "ResearchPrerequisiteError", "failure_message": "Research brief incomplete"})
         return {
             "final_report": "研究简报不完整，已停止生成未经验证的报告。",
             "messages": [AIMessage(content="研究简报不完整，无法生成报告。")],
             **cleared_state,
         }
     if not notes or not source_urls:
+        if state.get("session_id"):
+            await _finish_run(state, run_status=SessionRunStatus.FAILED, session_status=SessionStatus.FAILED)
+        if metrics:
+            metrics.incomplete = True
+            await metrics.finalize(None, source_urls, str(state.get("session_id")) if state.get("session_id") else None, status="failed", failure={"failure_stage": "final_report", "failure_type": "ReportGenerationFailed", "failure_message": "No successful final report"})
         return {
             "final_report": "未获得足够的研究记录或真实来源，已停止生成未经验证的报告。",
             "messages": [AIMessage(content="缺少真实检索证据，无法生成报告。")],
@@ -690,13 +924,20 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             )
             
             # Generate the final report
-            final_report = await configurable_model.with_config(writer_model_config).ainvoke([
+            final_report = await instrument_llm(configurable_model.with_config(writer_model_config).ainvoke, "final_report", [
                 HumanMessage(content=final_report_prompt)
             ])
             
             # Return successful report generation
+            if state.get("session_id"):
+                report_text = append_sources(str(final_report.content), source_urls)
+                await _finish_run(state, run_status=SessionRunStatus.COMPLETED, session_status=SessionStatus.COMPLETED, final_report=report_text)
+            else:
+                report_text = append_sources(str(final_report.content), source_urls)
+            if metrics:
+                await metrics.finalize(report_text, source_urls, str(state.get("session_id")) if state.get("session_id") else None)
             return {
-                "final_report": append_sources(str(final_report.content), source_urls),
+                "final_report": report_text,
                 "messages": [final_report],
                 **cleared_state
             }
@@ -710,6 +951,10 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     # First retry: determine initial truncation limit
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
+                        await _finish_run(state, run_status=SessionRunStatus.FAILED, session_status=SessionStatus.FAILED)
+                        if metrics:
+                            metrics.incomplete = True
+                            await metrics.finalize(None, source_urls, str(state.get("session_id")) if state.get("session_id") else None, status="failed", failure={"failure_stage": "final_report", "failure_type": "ReportGenerationFailed", "failure_message": "No successful final report"})
                         return {
                             "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
                             "messages": [AIMessage(content="Report generation failed due to token limits")],
@@ -726,6 +971,11 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 continue
             else:
                 # Non-token-limit error: return error immediately
+                if state.get("session_id"):
+                    await _finish_run(state, run_status=SessionRunStatus.FAILED, session_status=SessionStatus.FAILED)
+                if metrics:
+                    metrics.incomplete = True
+                    await metrics.finalize(None, source_urls, str(state.get("session_id")) if state.get("session_id") else None, status="failed", failure={"failure_stage": "final_report", **error_facts(e)})
                 return {
                     "final_report": f"Error generating final report: {e}",
                     "messages": [AIMessage(content="Report generation failed due to an error")],
@@ -733,6 +983,11 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 }
     
     # Step 4: Return failure result if all retries exhausted
+    if state.get("session_id"):
+        await _finish_run(state, run_status=SessionRunStatus.FAILED, session_status=SessionStatus.FAILED)
+    if metrics:
+        metrics.incomplete = True
+        await metrics.finalize(None, source_urls, str(state.get("session_id")) if state.get("session_id") else None, status="failed", failure={"failure_stage": "final_report", "failure_type": "ReportGenerationFailed", "failure_message": "No successful final report"})
     return {
         "final_report": "Error generating final report: Maximum retries exceeded",
         "messages": [AIMessage(content="Report generation failed after maximum retries")],
@@ -759,7 +1014,7 @@ deep_researcher_builder.add_edge("research_supervisor", "final_report_generation
 deep_researcher_builder.add_edge("final_report_generation", END)                   # Final exit point
 
 # Compile the complete deep researcher workflow
-deep_researcher = deep_researcher_builder.compile()
+deep_researcher = deep_researcher_builder.compile().with_config({"callbacks": [FailureObserver()]})
 
 # Stable public graph name used by the local workbench and frontend.
 deep_research = deep_researcher
