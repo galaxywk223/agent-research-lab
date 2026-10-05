@@ -14,7 +14,7 @@ from eval.common import ROOT, atomic_json, read_json, sha256
 from eval.development import dataset_assets, verify_holdout
 from eval.evaluate import DIMENSIONS, CoverageOutput, Judge, evaluate_result, judge_call
 from eval.evidence import compact_business
-from eval.run_benchmark import Runner, config_valid, latest_attempt
+from eval.run_benchmark import Runner, config_valid, latest_attempt, read_attempt
 
 
 class API:
@@ -143,11 +143,41 @@ async def test_create_disconnect_resume_queries_existing_run(setup_runner):
     api.disconnect = True
     first = await runner.execute(question)
     assert first["create_state"] == "unknown" and api.creates == 1
+    journal = runner.directory / "attempts/D01/attempt-0001.json"
+    identity_bytes = journal.read_bytes()
     restored = await runner.execute(question, read_json(runner.directory / "D01.json"))
     assert restored["status"] == "completed" and api.creates == 1
     assert restored["thread_id"] == first["thread_id"]
+    assert journal.read_bytes() == identity_bytes
     assert (await runner.execute(question, restored))["run_id"] == "run-1"
     assert api.creates == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_recovery_ignores_pointer_identity(setup_runner):
+    """Recover from the journal even if the mutable pointer has a newer wrong identity."""
+    runner, api, question = setup_runner
+    api.disconnect = True
+    first = await runner.execute(question)
+    wrong = {**first, "thread_id": "wrong", "request_identity": "wrong", "journal_revision": 999}
+    atomic_json(runner.directory / "D01.json", wrong)
+    restored = await runner.execute(question, wrong)
+    assert restored["status"] == "completed"
+    assert restored["thread_id"] == first["thread_id"]
+    assert restored["run_id"] == "run-1" and api.creates == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_disconnect_pointer_remains_recoverable(setup_runner):
+    """Read legacy pointer-only recovery state without another Run creation."""
+    runner, api, question = setup_runner
+    legacy = runner.new_attempt(question, None)
+    await api.create(legacy["thread_id"], "fake", metadata={"request_identity": legacy["request_identity"]})
+    legacy["create_state"] = "unknown"
+    atomic_json(runner.directory / "D01.json", legacy)
+    restored = await runner.execute(question)
+    assert restored["status"] == "completed" and restored["run_id"] == "run-1"
+    assert restored["thread_id"] == legacy["thread_id"] and api.creates == 1
 
 
 @pytest.mark.asyncio
@@ -168,12 +198,19 @@ async def test_timeout_running_resume_does_not_create_again(setup_runner):
     api.wait = True
     first = await runner.execute(question)
     assert first["api_status"] == "waiting_timeout"
+    identity = (first["thread_id"], first["run_id"])
+    assert first["status"] != "failed" and first["finished_at"] is None
     active = await runner.execute(question, first, retry_failed=True)
     assert api.creates == 1 and active["attempt_no"] == 1
+    assert (active["thread_id"], active["run_id"]) == identity
+    ordinary_resume = await runner.execute(question, active)
+    assert ordinary_resume["status"] != "failed" and api.creates == 1
+    assert (ordinary_resume["thread_id"], ordinary_resume["run_id"]) == identity
     api.wait = False
     api.rows[0]["status"] = "success"
     restored = await runner.execute(question, active)
     assert restored["status"] == "completed" and api.creates == 1
+    assert (restored["thread_id"], restored["run_id"]) == identity
 
 
 @pytest.mark.asyncio
@@ -220,13 +257,51 @@ async def test_explicit_failed_retry_preserves_old_identity(setup_runner):
     first["status"] = "failed"
     api.rows[0]["status"] = "error"
     runner.save(first)
+    identity_file = runner.directory / "attempts/D01/attempt-0001.json"
+    identity_bytes = identity_file.read_bytes()
+    creates_before_resume = api.creates
     no_retry = await runner.execute(question, first)
     assert no_retry["status"] == "failed" and api.creates == 1
+    assert api.creates - creates_before_resume == 0
     second = await runner.execute(question, first, retry_failed=True)
     assert api.creates == 2 and second["attempt_no"] == 2
+    assert api.creates - creates_before_resume == 1
+    assert second["run_id"] != first["run_id"]
     assert second["thread_id"] != first["thread_id"]
-    history = read_json(runner.directory / "attempts/D01/attempt-0001.json")
+    assert second["retry_of"]["run_id"] == first["run_id"]
+    assert second["retry_of"]["attempt_no"] == 1
+    assert identity_file.read_bytes() == identity_bytes
+    history = read_attempt(runner.directory, "D01", 1)
     assert history["run_id"] == "run-1" and history["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_failed_retry_checks_remote_running_state(setup_runner):
+    """Keep a remotely active Run even when local failure metadata is stale."""
+    runner, api, question = setup_runner
+    first = await runner.execute(question)
+    first.update(status="failed", api_status="error")
+    runner.save(first)
+    api.rows[0]["status"] = "running"
+    api.wait = True
+    restored = await runner.execute(question, retry_failed=True)
+    assert restored["run_id"] == first["run_id"]
+    assert restored["attempt_no"] == 1 and api.creates == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_retry_blocks_on_remote_lookup_error(setup_runner):
+    """A failed metadata query cannot authorize a replacement Run."""
+    runner, api, question = setup_runner
+    first = await runner.execute(question)
+    first["status"] = "failed"
+    runner.save(first)
+    async def unavailable(*args):
+        raise ConnectionError("mock metadata query unavailable")
+    api.runs.get = unavailable
+    restored = await runner.execute(question, retry_failed=True)
+    assert restored["run_id"] == first["run_id"]
+    assert restored["attempt_no"] == 1 and api.creates == 1
 
 
 @pytest.mark.asyncio
