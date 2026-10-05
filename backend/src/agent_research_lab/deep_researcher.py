@@ -3,6 +3,7 @@
 import asyncio
 import time
 import uuid
+from functools import wraps
 from typing import Literal
 
 from langchain_core.messages import (
@@ -14,6 +15,7 @@ from langchain_core.messages import (
     get_buffer_string,
 )
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import get_runtime
 from langgraph.types import Command
@@ -88,6 +90,57 @@ configurable_model = create_chat_model(
 repository = ResearchRepository()
 
 
+async def _finalize_root_error(state, config, error, role):
+    """Persist fatal root failure without replacing the original exception."""
+    _, run_id = _execution_ids(state, config)
+    session_id = state.get("session_id")
+    facts = {"failure_stage": role, **error_facts(error)}
+    metrics = metrics_for(run_id)
+    try:
+        transition = await repository.finalize_failed_run(run_id, facts)
+        session_id = session_id or transition.get("session_id")
+    except Exception as cleanup_error:
+        facts["database_finalization_error"] = error_facts(cleanup_error)
+    if metrics:
+        try:
+            await metrics.finalize(None, [], str(session_id) if session_id else None,
+                                   status="failed", failure=facts)
+        except Exception:
+            import logging
+
+            logging.warning("Fatal failure metrics finalization failed")
+
+
+def _fatal_root_node(role):
+    """Observe pre-invocation failures as well as unhandled root node errors."""
+    def decorate(node):
+        @wraps(node)
+        async def observed(state, config):
+            try:
+                return await node(state, config)
+            except Exception as error:
+                if not isinstance(error, GraphBubbleUp):
+                    await _finalize_root_error(state, config, error, role)
+                raise
+        return observed
+    return decorate
+
+
+async def _invoke_observed(state, config, invoke, role: str, messages):
+    """Finalize only fatal root roles when the API callback loses its frame.
+
+    Researcher/compression failures remain under Task gather semantics. The
+    final-report node owns its existing retry/failure path.
+    """
+    try:
+        return await instrument_llm(invoke, role, messages)
+    except BaseException as error:
+        if role not in {"clarification", "research_brief", "supervisor"} or not isinstance(error, Exception) or isinstance(error, GraphBubbleUp):
+            raise
+        await _finalize_root_error(state, config, error, role)
+        raise
+
+
 def _execution_ids(state: AgentState | SupervisorState | ResearcherState, config: RunnableConfig) -> tuple[str, str]:
     """Resolve the current Thread and Run identifiers without forcing UUID types."""
     thread_id = str(config.get("configurable", {}).get("thread_id") or "standalone")
@@ -145,6 +198,7 @@ async def _finish_run(state: AgentState, *, run_status: SessionRunStatus, sessio
         if final_report is not None and state.get("session_id"):
             await repository.update_session(uuid.UUID(str(state["session_id"])), status=session_status, final_report=final_report)
 
+@_fatal_root_node("clarification")
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
     
@@ -165,7 +219,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     else:
         activate_run(run_id)
     if metrics_for(run_id):
-        metrics_for(run_id).question_id = question_id()
+        metrics_for(run_id).question_id = question_id() or (config.get("metadata") or {}).get("question_id")
     session_update = {"run_id": run_id, "research_id": research_id, "session_id": str(session.id)}
 
     # Step 1: Check if clarification is enabled in configuration
@@ -196,7 +250,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         messages=get_buffer_string(messages), 
         date=get_today_str()
     )
-    response = await instrument_llm(clarification_model.ainvoke, "clarification", [HumanMessage(content=prompt_content)])
+    response = await _invoke_observed(state, config, clarification_model.ainvoke, "clarification", [HumanMessage(content=prompt_content)])
     
     # Step 4: Route based on clarification analysis
     if response.need_clarification:
@@ -217,6 +271,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         )
 
 
+@_fatal_root_node("research_brief")
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
     """Transform user messages into a structured research brief and initialize supervisor.
     
@@ -259,7 +314,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     )
-    response = await instrument_llm(research_model.ainvoke, "research_brief", [HumanMessage(content=prompt_content)])
+    response = await _invoke_observed(state, config, research_model.ainvoke, "research_brief", [HumanMessage(content=prompt_content)])
 
     if not is_valid_research_brief(response.research_brief):
         metrics = metrics_for(_execution_ids(state, config)[1])
@@ -297,6 +352,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
 
 
+@_fatal_root_node("supervisor")
 async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools"]]:
     """Lead research supervisor that plans research strategy and delegates to researchers.
     
@@ -334,7 +390,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     
     # Step 2: Generate supervisor response based on current context
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await instrument_llm(research_model.ainvoke, "supervisor", supervisor_messages)
+    response = await _invoke_observed(state, config, research_model.ainvoke, "supervisor", supervisor_messages)
     
     # Step 3: Update state and proceed to tool execution
     return Command(
@@ -610,7 +666,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     if state.get("attempt_id"):
         await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
     started = time.perf_counter()
-    response = await instrument_llm(research_model.ainvoke, "researcher", messages)
+    response = await _invoke_observed(state, config, research_model.ainvoke, "researcher", messages)
     if metrics and state.get("task_id"):
         metrics.task(str(state["task_id"])).round_start = started
     if task_token:
@@ -794,7 +850,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             # Execute compression
             if state.get("attempt_id"):
                 await repository.refresh_attempt_lease(uuid.UUID(str(state["attempt_id"])))
-            response = await instrument_llm(synthesizer_model.ainvoke, "compression", messages)
+            response = await _invoke_observed(state, config, synthesizer_model.ainvoke, "compression", messages)
             if task_token:
                 reset_task(task_token)
             if state.get("attempt_id"):
@@ -856,6 +912,7 @@ researcher_builder.add_edge("compress_research", END)      # Exit point after co
 # Compile researcher subgraph for parallel execution by supervisor
 researcher_subgraph = researcher_builder.compile()
 
+@_fatal_root_node("final_report")
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final comprehensive research report with retry logic for token limits.
     
@@ -924,7 +981,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             )
             
             # Generate the final report
-            final_report = await instrument_llm(configurable_model.with_config(writer_model_config).ainvoke, "final_report", [
+            final_report = await _invoke_observed(state, config, configurable_model.with_config(writer_model_config).ainvoke, "final_report", [
                 HumanMessage(content=final_report_prompt)
             ])
             

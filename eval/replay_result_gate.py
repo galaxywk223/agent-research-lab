@@ -15,17 +15,23 @@ from eval.common import atomic_json
 
 def _summary_by_result(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Join summary cost only where v2 contains an explicit result_id."""
-    llm = {
-        event.get("logical_llm_call_id"): event
-        for event in record.get("llm_events", [])
-    }
+    from eval.profile_v2 import unique_index
+
+    llm = unique_index(record.get("llm_events", []), "logical_llm_call_id")
+    unique_index(record.get("summary_events", []), "summary_call_id")
     joined = {}
     for summary in record.get("summary_events", []):
         result_id = summary.get("result_id")
         if not result_id:
-            continue
+            raise ValueError("summary missing result_id")
+        if result_id in joined:
+            raise ValueError("duplicate result processing outcome")
+        call_id = summary.get("logical_llm_call_id")
+        if call_id and call_id not in llm:
+            raise ValueError("orphan model invocation")
         event = llm.get(summary.get("logical_llm_call_id"), {})
         joined[result_id] = {
+            "logical_llm_call_id": call_id,
             "status": summary.get("outcome") or event.get("status"),
             "prompt_tokens": (event.get("usage") or {}).get("prompt_tokens"),
             "completion_tokens": (event.get("usage") or {}).get("completion_tokens"),
@@ -39,15 +45,21 @@ def replay(
     record: dict[str, Any], policies: list[ShadowPolicy] | None = None
 ) -> dict[str, Any]:
     """Calculate local avoided processing cost without changing agent state."""
-    results = record.get("result_events") or []
+    results = [r for r in record.get("result_events", []) if r.get("selected_after_raw_url_dedup", True)]
     if not results:
         return {
             "status": "unavailable",
             "reason": "strict result events are absent",
             "local_counterfactual": True,
+            "full_agent_causal_estimate": False,
         }
     policies = policies or default_policies()
     summaries = _summary_by_result(record)
+    from eval.profile_v2 import unique_index
+
+    unique_index(results, "result_id")
+    if set(summaries) != {r["result_id"] for r in results}:
+        return {"status": "unavailable", "reason": "incomplete processing attribution", "local_counterfactual": True, "full_agent_causal_estimate": False}
     output = {}
     score_values = [result.get("score") for result in results]
     rank_values = [result.get("rank") for result in results]
@@ -101,7 +113,7 @@ def replay(
             if decision["would_drop"]:
                 dropped += 1
                 cost = summaries.get(result.get("result_id"))
-                if cost:
+                if cost and cost.get("logical_llm_call_id"):
                     for key in avoided:
                         avoided[key].append(cost.get(key))
             else:
@@ -116,13 +128,14 @@ def replay(
                 1
                 for result in results
                 if result.get("result_id") in summaries
+                and summaries[result["result_id"]].get("logical_llm_call_id")
                 and shadow_trace(result, [policy])["policies"][policy.name][
                     "would_drop"
                 ]
             ),
             "counterfactual_avoided_observed": {
                 key: sum(values)
-                if values and all(value is not None for value in values)
+                if all(value is not None for value in values)
                 else None
                 for key, values in avoided.items()
             },

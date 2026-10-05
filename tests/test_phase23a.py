@@ -55,7 +55,8 @@ async def test_every_deduped_result_has_identity_and_seen_before_signals():
     assert second["duplicate_of_result_id"] == first["result_id"]
     assert second["content_hash_seen_before_in_research"] is True
     assert second["shadow_gate_mode"] == "observe_only"
-    assert second["shadow_decisions"]["duplicate_url"]["would_drop"] is True
+    assert second["shadow_decisions"]["same_url_same_objective"]["would_drop"] is False
+    assert second["summary_objective_id"] is None
 
 
 @pytest.mark.asyncio

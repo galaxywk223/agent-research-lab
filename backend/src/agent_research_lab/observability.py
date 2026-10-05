@@ -25,6 +25,25 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def summary_objective_id(template: str, date: str, output_schema: dict) -> str:
+    """Fingerprint the actual non-content prompt fields and output contract.
+
+    Query, topic and task are absent from the summarization prompt. Web content
+    is separately fingerprinted as summary_input_hash, never normalized here.
+    """
+    import unicodedata
+
+    payload = {
+        "version": 2,
+        "template": unicodedata.normalize("NFC", template.replace("\r\n", "\n")),
+        "date": unicodedata.normalize("NFC", date).strip(),
+        "output_schema": output_schema,
+    }
+    return digest(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def redact(text: str) -> str:
     """Redact configured credentials and common credential spellings."""
     for name, value in os.environ.items():
@@ -84,7 +103,9 @@ class ObservationMixin:
         self._task_arrival_urls: dict[str, set[str]] = {}
         self._task_arrival_hashes: dict[str, set[str]] = {}
         self._task_arrival_domains: dict[str, set[str]] = {}
-        self._round_domain_counts: dict[tuple[str, int | None, str], int] = {}
+        self._round_domain_counts: dict[tuple, int] = {}
+        self._arrival_content_objectives: dict[tuple[str, str | None], str] = {}
+        self._arrival_url_objectives: dict[tuple[str, str | None], str] = {}
 
     def event_scope(self) -> dict:
         """Return a copy of strictly bound identities."""
@@ -242,7 +263,12 @@ class ObservationMixin:
             return event
 
     async def result_observation(
-        self, result: dict, query: dict, rank: int, representative: str | None
+        self,
+        result: dict,
+        query: dict,
+        rank: int,
+        representative: str | None,
+        summary_objective_id: str | None = None,
     ) -> dict:
         """Capture raw result facts without altering selection or model inputs."""
         import math
@@ -251,57 +277,110 @@ class ObservationMixin:
         from agent_research_lab.evidence import normalize_url
         from agent_research_lab.metrics import extract_domain
 
-        raw = result.get("raw_content")
-        score = result.get("score")
-        score = (
-            score if isinstance(score, int | float) and math.isfinite(score) else None
-        )
-        task_id = self.event_scope().get("task_id")
-        task_urls = self._task_arrival_urls.setdefault(task_id or "", set())
-        task_hashes = self._task_arrival_hashes.setdefault(task_id or "", set())
-        task_domains = self._task_arrival_domains.setdefault(task_id or "", set())
-
-        normalized = result.get("normalized_url") or normalize_url(
-            result.get("url", "")
-        )
-        raw_content = result.get("raw_content")
-        content_hash = result.get("raw_content_hash") or digest(raw_content) if isinstance(raw_content, str) else result.get("raw_content_hash")
-        domain = result.get("domain")
-        round_key = (task_id or "", self.event_scope().get("round_index"), domain or "")
-        domain_count = self._round_domain_counts.get(round_key, 0)
-        event = {
-            **self.event_scope(),
-            "result_id": str(uuid.uuid4()),
-            "query_id": query.get("query_id"),
-            "rank": rank,
-            "url": result.get("url"),
-            "normalized_url": normalize_url(result["url"]),
-            "title": result.get("title"),
-            "score": score,
-            "domain": extract_domain(result["url"]),
-            "raw_content_available": bool(raw),
-            "raw_content_char_count": len(raw) if raw is not None else None,
-            "raw_content_hash": digest(raw) if isinstance(raw, str) else None,
-            "snippet_char_count": len(result.get("content") or ""),
-            "duplicate_of_result_id": representative,
-            "selected_after_raw_url_dedup": representative is None,
-            "url_seen_before_in_task": normalized in task_urls if normalized else False,
-            "url_seen_before_in_research": normalized in self._arrival_urls
-            if normalized
-            else False,
-            "domain_seen_before_in_task": domain in task_domains if domain else False,
-            "domain_seen_before_in_research": domain in self._arrival_domains
-            if domain
-            else False,
-            "content_hash_seen_before_in_task": content_hash in task_hashes
-            if content_hash
-            else False,
-            "content_hash_seen_before_in_research": content_hash in self._arrival_hashes
-            if content_hash
-            else False,
-            "domain_seen_count_in_task_round": domain_count,
-        }
         async with self._lock:
+            raw = result.get("raw_content")
+            score = result.get("score")
+            score = (
+                score
+                if isinstance(score, int | float) and math.isfinite(score)
+                else None
+            )
+            task_id = self.event_scope().get("task_id")
+            task_urls = self._task_arrival_urls.setdefault(task_id or "", set())
+            task_hashes = self._task_arrival_hashes.setdefault(task_id or "", set())
+            task_domains = self._task_arrival_domains.setdefault(task_id or "", set())
+
+            normalized = result.get("normalized_url") or normalize_url(
+                result.get("url", "")
+            )
+            raw_content = result.get("raw_content")
+            content_hash = (
+                result.get("raw_content_hash") or digest(raw_content)
+                if isinstance(raw_content, str)
+                else result.get("raw_content_hash")
+            )
+            domain = extract_domain(normalized)
+            round_key = (
+                task_id or "",
+                self.event_scope().get("attempt_id"),
+                self.event_scope().get("round_index"),
+                domain or "",
+            )
+            domain_count = self._round_domain_counts.get(round_key, 0)
+            content_previous_objective = (
+                self._arrival_content_objectives.get(
+                    (content_hash, summary_objective_id)
+                )
+                if content_hash and summary_objective_id
+                else None
+            )
+            same_content_different_objective = bool(content_hash) and any(
+                digest == content_hash and objective != summary_objective_id
+                for (digest, objective) in self._arrival_content_objectives
+            )
+            same_url_previous_objective = (
+                self._arrival_url_objectives.get((normalized, summary_objective_id))
+                if normalized and summary_objective_id
+                else None
+            )
+            same_url_different_objective = bool(normalized) and any(
+                url == normalized and objective != summary_objective_id
+                for (url, objective) in self._arrival_url_objectives
+            )
+            event = {
+                **self.event_scope(),
+                "result_id": str(uuid.uuid4()),
+                "query_id": query.get("query_id"),
+                "rank": rank,
+                "result_rank": rank,
+                "url": result.get("url"),
+                "original_url": result.get("url"),
+                "normalized_url": normalize_url(result["url"]),
+                "title": result.get("title"),
+                "score": score,
+                "provider_score": score,
+                "domain": extract_domain(result["url"]),
+                "raw_content_available": bool(raw),
+                "raw_content_char_count": len(raw) if raw is not None else None,
+                "raw_content_hash": digest(raw) if isinstance(raw, str) else None,
+                "snippet_char_count": len(result.get("content") or ""),
+                "snippet_hash": digest(result.get("content") or ""),
+                "duplicate_of_result_id": representative,
+                "selected_after_raw_url_dedup": representative is None,
+                "summary_objective_id": summary_objective_id,
+                "summary_objective_version": 2 if summary_objective_id else None,
+                "same_content_same_objective_before": content_previous_objective
+                is not None,
+                "same_content_different_objective_before": same_content_different_objective,
+                "same_url_same_objective_before": same_url_previous_objective
+                is not None,
+                "same_url_different_objective_before": same_url_different_objective,
+                "domain_repeat_only_before": bool(domain in self._arrival_domains)
+                and normalized not in self._arrival_urls
+                and content_hash not in self._arrival_hashes
+                and not same_content_different_objective
+                and not same_url_different_objective,
+                "url_seen_before_in_task": normalized in task_urls
+                if normalized
+                else False,
+                "url_seen_before_in_research": normalized in self._arrival_urls
+                if normalized
+                else False,
+                "domain_seen_before_in_task": domain in task_domains
+                if domain
+                else False,
+                "domain_seen_before_in_research": domain in self._arrival_domains
+                if domain
+                else False,
+                "content_hash_seen_before_in_task": content_hash in task_hashes
+                if content_hash
+                else False,
+                "content_hash_seen_before_in_research": content_hash
+                in self._arrival_hashes
+                if content_hash
+                else False,
+                "domain_seen_count_in_task_round": domain_count,
+            }
             self.result_events.append(event)
             if normalized:
                 task_urls.add(normalized)
@@ -309,6 +388,14 @@ class ObservationMixin:
             if content_hash:
                 task_hashes.add(content_hash)
                 self._arrival_hashes.add(content_hash)
+                if summary_objective_id:
+                    self._arrival_content_objectives[
+                        (content_hash, summary_objective_id)
+                    ] = event["result_id"]
+            if normalized and summary_objective_id:
+                self._arrival_url_objectives[(normalized, summary_objective_id)] = (
+                    event["result_id"]
+                )
             if domain:
                 task_domains.add(domain)
                 self._arrival_domains.add(domain)
@@ -339,6 +426,11 @@ class ObservationMixin:
         }
         async with self._lock:
             self.summary_events.append(event)
+            if input_text is None:
+                for result_row in self.result_events:
+                    if result_row.get("result_id") == event.get("result_id"):
+                        result_row["summarization_status"] = "skipped_no_raw_content"
+                        result_row["summary_call_id"] = event["summary_call_id"]
         return event
 
     async def finish_summary(self, text: str, outcome: str) -> None:
@@ -348,9 +440,20 @@ class ObservationMixin:
                 if event["summary_call_id"] == scope.get().get("summary_call_id"):
                     event.update(
                         outcome=outcome,
+                        processing_outcome={
+                            "summarized": "success",
+                            "timeout_raw_fallback": "timeout",
+                            "error_raw_fallback": "error",
+                        }.get(outcome, outcome),
+                        fallback_disposition=outcome.endswith("raw_fallback"),
+                        summary_output_hash=digest(text),
                         output_hash=digest(text),
                         output_char_count=len(text),
                     )
+                    for result in self.result_events:
+                        if result.get("result_id") == event.get("result_id"):
+                            result["summarization_status"] = outcome
+                            result["summary_call_id"] = event.get("summary_call_id")
                     if outcome == "timeout_raw_fallback":
                         for llm in self.llm_events:
                             if (
@@ -358,3 +461,14 @@ class ObservationMixin:
                                 == event["logical_llm_call_id"]
                             ):
                                 llm["status"] = "timeout"
+
+    async def observe_summary_objective(self, objective_id: str) -> None:
+        """Bind the objective computed from the actual prompt's date and schema."""
+        async with self._lock:
+            summary_id = scope.get().get("summary_call_id")
+            for summary in self.summary_events:
+                if summary["summary_call_id"] == summary_id:
+                    summary["summary_objective_id"] = objective_id
+                    for result in self.result_events:
+                        if result["result_id"] == summary["result_id"]:
+                            result["summary_objective_id"] = objective_id

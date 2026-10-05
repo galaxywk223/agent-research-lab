@@ -33,7 +33,12 @@ from tavily import AsyncTavilyClient
 from agent_research_lab.configuration import Configuration, SearchAPI
 from agent_research_lab.evidence import content_hash
 from agent_research_lab.metrics import current_metrics, instrument_llm
-from agent_research_lab.observability import bind, error_facts, scope
+from agent_research_lab.observability import (
+    bind,
+    error_facts,
+    scope,
+    summary_objective_id,
+)
 from agent_research_lab.prompts import summarize_webpage_prompt
 from agent_research_lab.providers import fake_search_tool, provider_mode
 from agent_research_lab.state import ResearchComplete, Summary
@@ -42,6 +47,15 @@ from agent_research_lab.state import ResearchComplete, Summary
 ##########################
 # Tavily Search Tool Utils
 ##########################
+def _summary_objective(date):
+    """Keep objective observation errors outside the processing control flow."""
+    try:
+        return summary_objective_id(summarize_webpage_prompt, date, Summary.model_json_schema())
+    except Exception:
+        logging.warning("Summary objective observation failed")
+        return None
+
+
 async def observe(method, *args):
     """Run an observation without changing provider or tool behavior."""
     try:
@@ -94,7 +108,8 @@ async def tavily_search(
                 url = result['url']
                 query_event = tool_event["queries"][query_index] if tool_event else {}
                 representative = representative_events.get(url)
-                result_event = await observe(metrics.result_observation, result, query_event, rank, representative["result_id"] if representative else None) if metrics else None
+                objective_id = _summary_objective(get_today_str()) if metrics else None
+                result_event = await observe(metrics.result_observation, result, query_event, rank, representative["result_id"] if representative else None, objective_id) if metrics else None
                 if url not in unique_results:
                     representative_events[url] = result_event
                     unique_results[url] = {**result, "query": response['query']}
@@ -235,11 +250,19 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
     """
     try:
         # Create prompt with current date context
+        prompt_date = get_today_str()
         prompt_content = summarize_webpage_prompt.format(
             webpage_content=webpage_content, 
-            date=get_today_str()
+            date=prompt_date
         )
         
+        metrics = current_metrics()
+        if metrics:
+            await observe(
+                metrics.observe_summary_objective,
+                _summary_objective(prompt_date),
+            )
+
         # Execute summarization with timeout to prevent hanging
         summary = await asyncio.wait_for(
             instrument_llm(model.ainvoke, "summarization", [HumanMessage(content=prompt_content)]),

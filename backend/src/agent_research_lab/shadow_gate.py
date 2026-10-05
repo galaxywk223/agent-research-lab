@@ -24,12 +24,29 @@ def default_policies() -> list[ShadowPolicy]:
     """Return diagnostic policies without selecting production thresholds."""
     return [
         ShadowPolicy(
-            "duplicate_url", "duplicate_url", policy_class="deterministic_redundancy"
+            "same_content_same_objective",
+            "same_content_same_objective",
+            policy_class="processing_equivalent_candidate",
         ),
         ShadowPolicy(
-            "duplicate_content_hash",
-            "duplicate_content_hash",
-            policy_class="deterministic_redundancy",
+            "same_url_same_objective",
+            "same_url_same_objective",
+            policy_class="url_duplicate_only",
+        ),
+        ShadowPolicy(
+            "same_content_different_objective",
+            "same_content_different_objective",
+            policy_class="context_changed_duplicate",
+        ),
+        ShadowPolicy(
+            "same_url_different_objective",
+            "same_url_different_objective",
+            policy_class="url_duplicate_only",
+        ),
+        ShadowPolicy(
+            "domain_repeat_only",
+            "domain_repeat_only",
+            policy_class="heuristic_selectivity",
         ),
         ShadowPolicy("top_k_3", "top_k", 3),
         ShadowPolicy("score_0_5", "score", 0.5),
@@ -49,6 +66,22 @@ def _decision(policy: ShadowPolicy, result: dict[str, Any]) -> dict[str, Any]:
             if drop
             else "research_content_hash_new_or_missing"
         )
+    elif policy.kind in {
+        "same_content_same_objective",
+        "same_url_same_objective",
+        "same_content_different_objective",
+        "same_url_different_objective",
+        "domain_repeat_only",
+    }:
+        signal = {
+            "same_content_same_objective": "same_content_same_objective_before",
+            "same_url_same_objective": "same_url_same_objective_before",
+            "same_content_different_objective": "same_content_different_objective_before",
+            "same_url_different_objective": "same_url_different_objective_before",
+            "domain_repeat_only": "domain_repeat_only_before",
+        }[policy.kind]
+        drop = bool(result.get(signal))
+        reason = "observed_candidate_match" if drop else "no_candidate_match"
     elif policy.kind == "top_k":
         rank = result.get("rank")
         drop = rank is not None and rank > int(policy.value)
@@ -91,6 +124,12 @@ def shadow_trace(
                 "domain_seen_before_in_task",
                 "domain_seen_count_in_task_round",
                 "raw_content_char_count",
+                "summary_objective_id",
+                "same_content_same_objective_before",
+                "same_content_different_objective_before",
+                "same_url_same_objective_before",
+                "same_url_different_objective_before",
+                "domain_repeat_only_before",
             )
         },
         "policies": {policy.name: _decision(policy, result) for policy in policies},

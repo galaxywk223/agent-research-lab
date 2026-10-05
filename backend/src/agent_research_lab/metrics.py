@@ -491,6 +491,13 @@ class ResearchMetrics(ObservationMixin):
                 for key in ("prompt_tokens", "completion_tokens", "total_tokens")
             )
             row["latency_ms"] = linked.get("latency_ms")
+            row.update({key: (linked.get("usage") or {}).get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})
+            row["status"] = linked.get("status") if linked else row.get("outcome")
+            row["processing_outcome"] = {
+                "summarized": "success", "timeout_raw_fallback": "timeout",
+                "error_raw_fallback": "error",
+            }.get(row.get("outcome"), row.get("outcome"))
+            row["summary_output_hash"] = row.get("output_hash")
             serialized_summaries.append(row)
         funnel = {
             "tavily_raw_results": self.search.get("raw_result_count", 0),
