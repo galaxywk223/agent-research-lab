@@ -223,12 +223,14 @@ async def tavily_search_async(
             result = await tavily_client.search(query, max_results=max_results, include_raw_content=include_raw_content, topic=topic)
             if request_event:
                 request_event.update(status="success", result_count=len(result.get("results", [])), latency_ms=(time.perf_counter()-started)*1000)
+                await metrics.finish_search_request(request_event)
             elif metrics:
                 await observe(metrics.provider_request, query, (time.perf_counter()-started)*1000, len(result.get("results", [])))
             return result
         except BaseException as error:
             if request_event:
-                request_event.update(status="error", **error_facts(error), latency_ms=(time.perf_counter()-started)*1000)
+                request_event.update(status="error", _error_identity=id(error), **error_facts(error), latency_ms=(time.perf_counter()-started)*1000)
+                await metrics.finish_search_request(request_event)
             raise
         finally:
             scope.reset(token)

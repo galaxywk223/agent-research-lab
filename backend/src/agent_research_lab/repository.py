@@ -300,6 +300,46 @@ class ResearchRepository:
                     research.updated_at = func.now()
                 return {"run_id": run_id, "session_id": str(run.session_id), "before": before, "after": {"session": research.status, "session_run": run.status}}
 
+    async def finalize_api_process_exit(self, run_id: str, failure: dict) -> dict:
+        """Fail only work owned by a Run whose API process exit is confirmed."""
+        async with database_session() as db:
+            async with db.begin():
+                run = await db.scalar(select(SessionRun).where(SessionRun.run_id == run_id).with_for_update())
+                if run is None:
+                    raise KeyError(f"Run not found: {run_id}")
+                research = await db.scalar(select(Session).where(Session.id == run.session_id).with_for_update())
+                attempts = list((await db.scalars(
+                    select(TaskAttempt).join(Task).where(
+                        Task.session_id == run.session_id,
+                        TaskAttempt.status == AttemptStatus.RUNNING,
+                    ).with_for_update()
+                )).all())
+                failed_attempts = 0
+                for attempt in attempts:
+                    if (attempt.metadata_ or {}).get("execution_run_id") != run_id:
+                        continue
+                    attempt.status = AttemptStatus.FAILED
+                    attempt.error = "langgraph_api_process_exited"
+                    attempt.finished_at = func.now()
+                    task = await db.scalar(select(Task).where(Task.id == attempt.task_id).with_for_update())
+                    if task and task.status == TaskStatus.RUNNING:
+                        task.status = TaskStatus.FAILED
+                        task.updated_at = func.now()
+                    failed_attempts += 1
+                if run.status == SessionRunStatus.RUNNING:
+                    run.status = SessionRunStatus.FAILED
+                    run.finished_at = func.now()
+                    run.metadata_ = {**(run.metadata_ or {}), "failure": json_safe(failure)}
+                other_active = await db.scalar(select(SessionRun.id).where(
+                    SessionRun.session_id == run.session_id,
+                    SessionRun.run_id != run_id,
+                    SessionRun.status == SessionRunStatus.RUNNING,
+                ).limit(1))
+                if not other_active and research.status == SessionStatus.RUNNING:
+                    research.status = SessionStatus.FAILED
+                    research.updated_at = func.now()
+                return {"run_id": run_id, "session_id": str(run.session_id), "failed_task_attempts": failed_attempts}
+
     async def fail_owned_attempt(self, attempt_id: uuid.UUID, run_id: str, error: str) -> bool:
         """Fail only a running Attempt whose persisted owner is this exact Run."""
         async with database_session() as db:

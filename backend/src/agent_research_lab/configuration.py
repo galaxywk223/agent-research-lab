@@ -1,4 +1,4 @@
-"""Configuration management for the Open Deep Research system."""
+"""Configuration management for the Agent Research Lab system."""
 
 import os
 from enum import Enum

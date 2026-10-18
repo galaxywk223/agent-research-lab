@@ -86,6 +86,27 @@ def test_question_selection_is_explicit():
         select_questions(questions, ["D05", "D05"])
 
 
+def test_attempt_reader_uses_last_event_when_revision_is_tied(tmp_path):
+    """A legacy equal-revision terminal event wins by append order."""
+    from eval.run_benchmark import read_attempt
+
+    folder = tmp_path / "attempts" / "D05"
+    (folder / "events").mkdir(parents=True)
+    identity = {
+        "question_id": "D05", "attempt_no": 1, "thread_id": "thread",
+        "request_identity": "request", "experiment_id": "experiment",
+    }
+    (folder / "attempt-0001.json").write_text(json.dumps(identity))
+    rows = [
+        {**identity, "journal_revision": 6, "status": "incomplete"},
+        {**identity, "journal_revision": 6, "status": "failed", "error": {"type": "ControlledApiProcessExited"}},
+    ]
+    (folder / "events" / "attempt-0001.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n"
+    )
+    assert read_attempt(tmp_path, "D05", 1)["status"] == "failed"
+
+
 def test_dry_run_has_no_client_or_provider_calls(tmp_path):
     """Dry-run does not create the experiment directory."""
     questions = [SimpleNamespace(question_id="D05")]

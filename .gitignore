@@ -25,6 +25,7 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
@@ -71,3 +72,6 @@ temp/
 .codex-python-env.local.json
 .next/
 .benchmarks/
+eval/results/
+eval/runs/
+eval/runtime_events/

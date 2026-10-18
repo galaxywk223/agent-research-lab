@@ -198,15 +198,18 @@ class ResearchMetrics(ObservationMixin):
         self, query: str, latency_ms: float, result_count: int | None
     ) -> None:
         """Record one actual Tavily request's monotonic duration."""
+        request_id = str(uuid.uuid4())
         async with self._lock:
-            self.search_request_events.append(
-                {
+            event = {
                     **self.event_scope(),
+                    "search_request_id": request_id,
                     "query": query,
+                    "status": "success",
                     "latency_ms": round(latency_ms, 3),
                     "result_count": result_count,
                 }
-            )
+            self.search_request_events.append(event)
+        await self._journal("search_request_finished", event)
 
     def task(self, task_id: str, topic: str = "") -> TaskMetrics:
         """Get a task-local metrics bucket."""
@@ -274,6 +277,12 @@ class ResearchMetrics(ObservationMixin):
                         task.domains.add(domain)
             if round_metrics:
                 round_metrics.content_hashes.extend(hashes or [])
+            await self._journal("search_results_counted", {
+                **self.event_scope(),
+                "search_tool_call_id": scoped_tool,
+                "raw_result_count": raw_count,
+                "deduped_result_count": deduped_count,
+            })
 
     async def evidence_event(self, observations: list[dict[str, Any]]) -> None:
         """Record hashes of Evidence content submitted to persistence."""
@@ -317,6 +326,16 @@ class ResearchMetrics(ObservationMixin):
             self._add_round(
                 task_id, round_index, queries, returned_urls, content_hashes, latency_ms
             )
+            row = self._round_for(task_id, round_index)
+            snapshot = {
+                "round_id": row.round_id,
+                "task_id": task_id,
+                "attempt_id": _attempt.get(),
+                "round_index": round_index,
+                "status": "completed",
+                "latency_ms": latency_ms,
+            }
+        await self._journal("round_completed", snapshot)
 
     def _add_round(
         self,
@@ -381,6 +400,8 @@ class ResearchMetrics(ObservationMixin):
         round_metrics.cumulative_unique_urls = len(before | set(normalized))
         round_metrics.cumulative_unique_domains = len(before_domains | set(domains))
         round_metrics.round_latency_ms = latency_ms
+        if not getattr(round_metrics, "round_id", None):
+            round_metrics.round_id = str(uuid.uuid4())
 
     async def finalize(
         self,
@@ -449,6 +470,10 @@ class ResearchMetrics(ObservationMixin):
                     record["finished_at"] = finished_at
                     record["metrics"]["total_latency_ms"] = elapsed
                     self._terminal_snapshot = copy.deepcopy(record)
+                await self._journal("research_terminal", {
+                    "status": self.status,
+                    "failure": self.failure,
+                })
             tmp = None
             try:
                 path = Path(os.getenv("AGENTLAB_METRICS_DIR", "eval/results"))

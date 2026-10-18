@@ -1,0 +1,39 @@
+{
+  "version": "v1",
+  "coverage": {
+    "covered": 1,
+    "partially_covered": 0.5,
+    "not_covered": 0
+  },
+  "quality_anchors": {
+    "completeness": {
+      "1": "大多数 requirements 未回答，核心问题缺失",
+      "3": "主要问题有回答，但部分 requirements 或重要限定缺失",
+      "5": "全部 requirements 实质覆盖，边界和限制充分"
+    },
+    "relevance": {
+      "1": "大量偏题内容，未回应问题目标",
+      "3": "大体相关，但存在冗余或重点失衡",
+      "5": "全文直接服务问题目标，重点明确"
+    },
+    "evidence_support": {
+      "1": "关键结论缺少提供笔记的支持，或引用与结论明显不匹配",
+      "3": "多数关键结论有支持，但部分对应关系模糊或证据薄弱",
+      "5": "关键结论与提供笔记有清晰对应，不夸大支持范围"
+    },
+    "synthesis": {
+      "1": "罗列片段，缺少比较、解释或整合",
+      "3": "有基本比较和整合，但原因、冲突或不确定性分析有限",
+      "5": "跨资料形成连贯解释，处理差异、冲突和不确定性"
+    },
+    "research_notes_consistency": {
+      "1": "多处重要结论与提供笔记矛盾，或歪曲笔记中的数字、时间和限定",
+      "3": "整体一致，但存在局部不准确或未经支持的延伸",
+      "5": "忠实保留笔记中的事实、时间、口径和限定，无实质矛盾"
+    }
+  },
+  "intermediate_scores": "2 lies between anchors 1 and 3; 4 lies between anchors 3 and 5",
+  "quality_score_rule": "arithmetic mean of the five validated integer dimensions",
+  "context_kind": "retrieved_research_notes",
+  "original_source_verification": false
+}

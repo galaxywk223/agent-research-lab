@@ -1,0 +1,25 @@
+{
+  "strategy_name": "baseline_fixed",
+  "strategy_version": 1,
+  "git_commit": null,
+  "source": "Configuration defaults; this file is not a production configuration input",
+  "defaults": {
+    "allow_clarification": true,
+    "search_provider": "tavily",
+    "research_model": "openai:gpt-4.1",
+    "summarization_model": "openai:gpt-4.1-mini",
+    "compression_model": "openai:gpt-4.1",
+    "final_report_model": "openai:gpt-4.1",
+    "max_concurrent_research_units": 5,
+    "max_researcher_iterations": 6,
+    "supervisor_stop_comparison": ">",
+    "max_react_tool_calls": 10,
+    "max_structured_output_retries": 3,
+    "max_content_length": 50000,
+    "research_model_max_tokens": 10000,
+    "summarization_model_max_tokens": 8192,
+    "compression_model_max_tokens": 8192,
+    "final_report_model_max_tokens": 10000,
+    "tavily_max_results_per_query": 5
+  }
+}

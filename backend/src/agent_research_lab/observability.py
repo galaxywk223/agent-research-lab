@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -91,6 +92,13 @@ def error_facts(error: BaseException) -> dict:
 class ObservationMixin:
     """Keep event association inside one Research collector."""
 
+    async def _journal(self, event_type: str, event: dict) -> None:
+        import asyncio
+
+        from agent_research_lab.incremental import append_event
+
+        await asyncio.to_thread(append_event, self.run_id, self.research_id, event_type, event)
+
     def initialize_observations(self) -> None:
         """Initialize event storage without external counters."""
         self.result_events = []
@@ -143,6 +151,7 @@ class ObservationMixin:
             for summary in self.summary_events:
                 if summary["summary_call_id"] == event.get("summary_call_id"):
                     summary["logical_llm_call_id"] = event["logical_llm_call_id"]
+            await self._journal("llm_started", event)
             return event
 
     async def finish_llm(
@@ -196,6 +205,7 @@ class ObservationMixin:
                     self.usage[key] = (self.usage[key] or 0) + value
                     if task:
                         task.usage[key] = (task.usage[key] or 0) + value
+            await self._journal("llm_finished", event)
 
     def parent_llm_id(
         self, task_id: str, round_index: int, tool_id: str | None
@@ -251,6 +261,7 @@ class ObservationMixin:
                 "latency_ms": None,
                 "result_count": None,
                 "provider_network_attempts": None,
+                "search_request_id": str(uuid.uuid4()),
             }
             self.search_request_events.append(event)
             self.search["search_provider_requests"] += 1
@@ -260,6 +271,7 @@ class ObservationMixin:
                     self._round_for(
                         event["task_id"], event["round_index"]
                     ).search_provider_requests += 1
+            await self._journal("search_request_started", event)
             return event
 
     async def result_observation(
@@ -404,7 +416,12 @@ class ObservationMixin:
 
             event["shadow_gate_mode"] = "observe_only"
             event["shadow_decisions"] = shadow_trace(event)["policies"]
+            await self._journal("result_arrived", event)
         return event
+
+    async def finish_search_request(self, event: dict) -> None:
+        """Persist the completed provider request snapshot."""
+        await self._journal("search_request_finished", event)
 
     async def start_summary(self, result: dict, input_text: str | None) -> dict:
         """Record a selected result's summarization or no-raw-content branch."""
@@ -426,6 +443,7 @@ class ObservationMixin:
         }
         async with self._lock:
             self.summary_events.append(event)
+            await self._journal("summary_started", event)
             if input_text is None:
                 for result_row in self.result_events:
                     if result_row.get("result_id") == event.get("result_id"):
@@ -461,6 +479,7 @@ class ObservationMixin:
                                 == event["logical_llm_call_id"]
                             ):
                                 llm["status"] = "timeout"
+                    await self._journal("summary_finished", event)
 
     async def observe_summary_objective(self, objective_id: str) -> None:
         """Bind the objective computed from the actual prompt's date and schema."""
@@ -472,3 +491,4 @@ class ObservationMixin:
                     for result in self.result_events:
                         if result["result_id"] == summary["result_id"]:
                             result["summary_objective_id"] = objective_id
+                    await self._journal("summary_objective", summary)

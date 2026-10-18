@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from eval.common import atomic_json, read_json
+from eval.inclusion import valid_records
 
 TOKENS = ("prompt_tokens", "completion_tokens", "total_tokens")
 COST = (*TOKENS, "latency_ms")
@@ -609,13 +610,14 @@ def sweep(record: dict) -> dict:
 
 
 def load_completed(directory: Path) -> list[dict]:
-    """Read D03-D05 Development artifacts only; reject mixed provider/config."""
+    """Read only the immutable inclusion set; reject mixed provider/config."""
+    if (directory / "D03.json").exists() and not (directory / "inclusion_manifest.json").exists():
+        probe = read_json(directory / "D03.json")
+        if probe.get("dataset_split") != "development" or probe.get("provider_mode") != "real":
+            raise ValueError("split/provider/question mismatch")
     rows, configs = [], set()
-    for qid in ("D03", "D04", "D05"):
-        path = directory / f"{qid}.json"
-        if not path.exists():
-            continue
-        row = read_json(path)
+    for row in valid_records(directory):
+        qid = row.get("question_id")
         if (
             row.get("dataset_split") != "development"
             or row.get("provider_mode") != "real"

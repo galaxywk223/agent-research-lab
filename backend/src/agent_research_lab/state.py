@@ -62,6 +62,10 @@ def override_reducer(current_value, new_value):
 class AgentInputState(MessagesState):
     """InputState is only 'messages'."""
 
+    research_id: Optional[str] = None
+    new_research: bool = False
+    continuation: bool = False
+
 class AgentState(MessagesState):
     """Main agent state containing messages and research data."""
     
@@ -71,6 +75,9 @@ class AgentState(MessagesState):
     notes: Annotated[list[str], override_reducer] = []
     source_urls: Annotated[list[str], override_reducer] = []
     final_report: str
+    run_id: Optional[str] = None
+    session_id: Optional[str] = None
+    research_id: Optional[str] = None
 
 class SupervisorState(TypedDict):
     """State for the supervisor that manages research tasks."""
@@ -81,6 +88,9 @@ class SupervisorState(TypedDict):
     research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
     source_urls: Annotated[list[str], override_reducer] = []
+    run_id: str | None
+    session_id: str | None
+    research_id: str | None
 
 class ResearcherState(TypedDict):
     """State for individual researchers conducting research."""
@@ -91,6 +101,11 @@ class ResearcherState(TypedDict):
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
     source_urls: Annotated[list[str], override_reducer] = []
+    run_id: str | None
+    session_id: str | None
+    research_id: str | None
+    task_id: str
+    attempt_id: str | None
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""

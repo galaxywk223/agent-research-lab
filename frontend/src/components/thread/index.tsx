@@ -242,8 +242,16 @@ export function Thread() {
     // Do this so the loading state is correct
     prevMessageLength.current = prevMessageLength.current - 1;
     setFirstTokenReceived(false);
+    const researchId = (stream.values as Record<string, unknown> | undefined)
+      ?.research_id as string | undefined;
     stream.submit(undefined, {
       checkpoint: parentCheckpoint,
+      config: {
+        configurable: {
+          continuation: true,
+          research_id: researchId,
+        },
+      },
       streamMode: ["values"],
       streamSubgraphs: true,
       streamResumable: true,

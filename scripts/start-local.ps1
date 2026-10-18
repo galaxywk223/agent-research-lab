@@ -146,6 +146,21 @@ if ($searchApi -eq "tavily") {
 $missingKeys = @($requiredKeys | Select-Object -Unique | Where-Object {
   [string]::IsNullOrWhiteSpace((Get-EnvValue $envPath $_))
 })
+$databaseUri = Get-EnvValue $envPath "DATABASE_URI"
+$agentlabDatabaseUri = Get-EnvValue $envPath "AGENTLAB_DATABASE_URI"
+if ([string]::IsNullOrWhiteSpace($agentlabDatabaseUri)) {
+  $agentlabDatabaseUri = $databaseUri
+}
+if ([string]::IsNullOrWhiteSpace($databaseUri)) {
+  $missingKeys += "DATABASE_URI"
+}
+$providerMode = (Get-EnvValue $envPath "AGENTLAB_PROVIDER_MODE").ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($providerMode)) {
+  $providerMode = "real"
+}
+if ($providerMode -notmatch "^(real|fake)$") {
+  Fail "AGENTLAB_PROVIDER_MODE must be real or fake."
+}
 if ($missingKeys.Count -gt 0) {
   Start-Process -FilePath "notepad.exe" -ArgumentList "`"$envPath`""
   Fail "Missing required settings in .env: $($missingKeys -join ', '). Fill them in, save the file, and run the startup script again."
@@ -180,7 +195,7 @@ if ($backendRunning) {
   Start-Process -FilePath "powershell.exe" -WorkingDirectory $root -WindowStyle Hidden `
     -RedirectStandardOutput $backendStdoutLog -RedirectStandardError $backendStderrLog -ArgumentList @(
       "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-      "Set-Location -LiteralPath '$rootCommandPath'; uv run --project . langgraph dev --no-browser --no-reload --port $BackendPort"
+      "Set-Location -LiteralPath '$rootCommandPath'; `$env:AGENTLAB_DATABASE_URI='$agentlabDatabaseUri'; `$env:AGENTLAB_PROVIDER_MODE='$providerMode'; uv run --project . langgraph dev --no-browser --no-reload --port $BackendPort"
     )
 }
 if ($frontendRunning) {

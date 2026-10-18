@@ -32,6 +32,19 @@ from eval.judge_acceptance import scrub
 
 ACTIVE = {"pending", "running"}
 TERMINAL = {"completed", "failed"}
+LEGACY_API_FAILURE_TYPES = {"ControlledApiProcessExited", "APIProcessExited"}
+
+
+def is_api_process_failure(row: dict | None) -> bool:
+    """Recognize only durable API-process failures eligible for the controlled retry."""
+    if not row:
+        return False
+    error = row.get("error") or {}
+    return (
+        row.get("failure_origin") == "langgraph_api_process"
+        or row.get("execution_state") == "API_PROCESS_EXITED"
+        or error.get("type") in LEGACY_API_FAILURE_TYPES
+    )
 
 
 class ExecutionDecision(str, Enum):
@@ -57,6 +70,8 @@ def resolve_execution(
     if not row.get("run_id") and row.get("create_state") in {"started", "unknown"}:
         return ExecutionDecision.RECOVER_UNKNOWN
     if row.get("run_id"):
+        if row.get("execution_state") == "API_PROCESS_EXITED" or is_api_process_failure(row):
+            return ExecutionDecision.RETRY_FAILED if retry_failed else ExecutionDecision.PRESERVE_FAILED
         if remote_status in ACTIVE:
             return ExecutionDecision.RESUME_EXISTING
         if row.get("collection_status") == "failed":
@@ -107,7 +122,10 @@ def read_attempt(directory: Path, question_id: str, attempt_no: int) -> dict:
             raise ValueError("Attempt journal question identity mismatch")
         if identity and any(key in identity and row.get(key) != identity[key] for key in keys):
             raise ValueError("Attempt execution identity conflict")
-    return max(rows, key=lambda row: row.get("journal_revision", 0))
+    return max(
+        enumerate(rows),
+        key=lambda item: (item[1].get("journal_revision", 0), item[0]),
+    )[1]
 
 
 def latest_attempt(directory: Path, question_id: str) -> dict | None:
@@ -208,17 +226,33 @@ def historical_cost_preflight() -> dict:
     }
 
 
-def dry_run_plan(directory: Path, experiment_id: str, questions: list[Any]) -> dict:
+def dry_run_plan(
+    directory: Path,
+    experiment_id: str,
+    questions: list[Any],
+    retry_failed: bool = False,
+) -> dict:
     """Show intended work without instantiating a LangGraph client."""
     plan = []
     for q in questions:
         state, row = question_state(directory, q.question_id)
-        will_create = state == "new"
+        decision = ExecutionDecision.CREATE_NEW if state == "new" else None
+        if retry_failed and state == "failed" and is_api_process_failure(row):
+            decision = ExecutionDecision.RETRY_FAILED
+        will_create = decision in {
+            ExecutionDecision.CREATE_NEW,
+            ExecutionDecision.RETRY_FAILED,
+        }
         plan.append(
             {
                 "question_id": q.question_id,
                 "existing_state": state,
                 "existing_attempt_no": row.get("attempt_no") if row else None,
+                "existing_status": row.get("status") if row else None,
+                "decision": decision.value if decision else "PRESERVE_FAILED",
+                "planned_attempt_no": (row.get("attempt_no", 0) + 1)
+                if will_create and row
+                else row.get("attempt_no") if row else 1,
                 "will_create_new_run": will_create,
             }
         )
@@ -228,6 +262,8 @@ def dry_run_plan(directory: Path, experiment_id: str, questions: list[Any]) -> d
         "experiment_id": experiment_id,
         "question_ids": [q.question_id for q in questions],
         "new_run_count": sum(p["will_create_new_run"] for p in plan),
+        "planned_new_runs": sum(p["will_create_new_run"] for p in plan),
+        "retry_failed": retry_failed,
         "questions": plan,
         "cost_preflight": historical_cost_preflight(),
         "warning": "Observed usage is not a hard provider billing estimate.",
@@ -339,6 +375,44 @@ class Runner:
             )
         return matches[0] if matches else None
 
+    async def record_api_process_exit(self, row: dict, process: dict) -> None:
+        """Finalize only the exact business Run after a supervisor proves exit."""
+        failure = {
+            "failure_origin": "langgraph_api_process",
+            "failure_type": "APIProcessExited",
+            "failure_message": "LangGraph API process exited; graph execution is not recoverable",
+            "exit_code": process.get("exit_code"),
+            "last_health_success_at": process.get("last_health_success_at"),
+            "detected_at": process.get("detected_at"),
+            "stdout_log": process.get("stdout_log"),
+            "stderr_log": process.get("stderr_log"),
+        }
+        row.update(
+            status="failed",
+            execution_state="API_PROCESS_EXITED",
+            failure_origin="langgraph_api_process",
+            failure_finalization="pending",
+            finished_at=utc_now(),
+            error={"type": "APIProcessExited", "message": failure["failure_message"]},
+        )
+        try:
+            from agent_research_lab.repository import ResearchRepository
+
+            row["failure_finalization_result"] = await ResearchRepository().finalize_api_process_exit(row["run_id"], failure)
+            row["failure_finalization"] = "completed"
+        except Exception as exc:
+            row["failure_finalization"] = "failed"
+            row["failure_finalization_error"] = type(exc).__name__
+        try:
+            from agent_research_lab.incremental import reconstruct_partial_metrics
+
+            partial = reconstruct_partial_metrics(row["run_id"])
+            partial_dir = self.directory / "partial_metrics"
+            atomic_json(partial_dir / f"{row['question_id']}-attempt-{row['attempt_no']:04}.json", partial)
+            row["partial_metrics"] = partial
+        except FileNotFoundError:
+            row["partial_metrics"] = None
+
     async def execute(
         self, question: Any, prior: dict | None = None, retry_failed: bool = False
     ) -> dict:
@@ -361,6 +435,7 @@ class Runner:
                     })
                     return row
                 row.update(run_id=existing["run_id"], api_status=existing["status"],
+                           execution_state="RUNNING" if existing["status"] in ACTIVE else "RUN_TERMINAL",
                            create_state="confirmed", status="incomplete")
                 self.save(row)
                 retry_failed = False
@@ -368,6 +443,7 @@ class Runner:
             if decision == ExecutionDecision.RESUME_EXISTING:
                 current = await self.client.runs.get(row["thread_id"], row["run_id"])
                 row["api_status"] = current["status"]
+                row["execution_state"] = "RUNNING" if current["status"] in ACTIVE else "RUN_TERMINAL"
                 self.save(row)
                 decision = resolve_execution(row, retry_failed, current["status"])
             if decision in {ExecutionDecision.SKIP_COMPLETED, ExecutionDecision.PRESERVE_FAILED}:
@@ -386,6 +462,7 @@ class Runner:
                 existing = await self.find_run(row)
                 if existing:
                     row.update(run_id=existing["run_id"], api_status=existing["status"], create_state="confirmed")
+                    row["execution_state"] = "RUNNING" if existing["status"] in ACTIVE else "RUN_TERMINAL"
                     decision = ExecutionDecision.RESUME_EXISTING
                 else:
                     row["create_state"] = "started"
@@ -413,6 +490,7 @@ class Runner:
                 self.save(row)
             run = await self.client.runs.get(row["thread_id"], row["run_id"])
             row["api_status"] = run["status"]
+            row["execution_state"] = "RUNNING" if run["status"] in ACTIVE else "RUN_TERMINAL"
             self.save(row)
             if run["status"] in ACTIVE:
                 try:
@@ -421,17 +499,28 @@ class Runner:
                         self.timeout,
                     )
                 except TimeoutError:
+                    from eval.runtime_status import api_runtime_status
+
+                    process_status = api_runtime_status()
+                    process_exited = process_status["state"] == "API_PROCESS_EXITED"
+                    if process_exited:
+                        await self.record_api_process_exit(row, process_status)
                     row.update(
-                        api_status="waiting_timeout",
-                        error={
+                        api_status="error" if process_exited else "waiting_timeout",
+                        execution_state="API_PROCESS_EXITED" if process_exited else "RUNNER_TIMEOUT",
+                        failure_origin="langgraph_api_process" if process_exited else None,
+                        api_process=process_status,
+                    )
+                    if not process_exited:
+                        row["error"] = {
                             "type": "WaitTimeout",
                             "message": "Existing Run retained; resume will query it",
-                        },
-                    )
+                        }
                     self.save(row)
                     return row
                 run = await self.client.runs.get(row["thread_id"], row["run_id"])
             row["api_status"] = run["status"]
+            row["execution_state"] = "RUNNING" if run["status"] in ACTIVE else "RUN_TERMINAL"
             self.save(row)
             if run["status"] in ACTIVE:
                 return row
@@ -519,10 +608,23 @@ class Runner:
                     },
                 )
         except Exception as exc:
-            row["error"] = {
-                "type": type(exc).__name__,
-                "message": "API recovery failed; existing identity retained",
-            }
+            from eval.runtime_status import api_runtime_status
+
+            api_status = api_runtime_status()
+            failure_origin = {
+                "API_PROCESS_EXITED": "langgraph_api_process",
+                "API_UNREACHABLE": "unknown",
+            }.get(api_status["state"], "benchmark_runner")
+            if api_status["state"] == "API_PROCESS_EXITED" and row.get("run_id"):
+                await self.record_api_process_exit(row, api_status)
+            if api_status["state"] != "API_PROCESS_EXITED":
+                row["error"] = {
+                    "type": type(exc).__name__,
+                    "message": "API recovery failed; existing identity retained",
+                }
+            row["execution_state"] = api_status["state"]
+            row["api_process"] = api_status
+            row["failure_origin"] = failure_origin
         finally:
             row["last_api_wait_collect_latency_ms"] = round(
                 (time.perf_counter() - started) * 1000, 3
@@ -552,7 +654,10 @@ async def main_async(args: argparse.Namespace) -> dict:
     execute_real = getattr(args, "execute_real", False)
     if not execute_real and args.provider_mode == "real":
         return dry_run_plan(
-            ROOT / "runs" / args.experiment_id, args.experiment_id, selected
+            ROOT / "runs" / args.experiment_id,
+            args.experiment_id,
+            selected,
+            args.retry_failed,
         )
     if (
         args.provider_mode == "real"
@@ -586,12 +691,25 @@ async def main_async(args: argparse.Namespace) -> dict:
         accepted_source = (manifest.get("recovery_source_identity") or manifest).get(
             "source_snapshot_sha256"
         )
-        if accepted_source != expected["source_snapshot_sha256"] or any(
+        source_mismatch_retry = (
+            args.retry_failed
+            and [q.question_id for q in selected] == ["D05"]
+            and manifest.get("experiment_id") == "dev-baseline-v2-d05"
+            and is_api_process_failure(latest_attempt(directory, "D05"))
+            and accepted_source != expected["source_snapshot_sha256"]
+        )
+        if (accepted_source != expected["source_snapshot_sha256"] and not source_mismatch_retry) or any(
             manifest.get(key) != value
             for key, value in expected.items()
             if key not in {"source_snapshot_sha256", "question_ids"}
         ):
             raise ValueError("Experiment split/config/source identity changed")
+        if source_mismatch_retry:
+            manifest["recovery_source_identity"] = {
+                "source_snapshot_sha256": expected["source_snapshot_sha256"],
+                "previous_source_snapshot_sha256": accepted_source,
+                "reason": "explicit D05 attempt-0002 retry after API process failure",
+            }
         expected_ids = manifest.get("question_ids")
         if expected_ids and expected_ids != expected["question_ids"]:
             raise ValueError("Experiment question selection changed")
@@ -671,6 +789,9 @@ def main() -> None:
     parser.add_argument("--execute-real", action="store_true")
     parser.add_argument("--confirm-experiment")
     result = asyncio.run(main_async(parser.parse_args()))
+    if result.get("mode") == "dry_run":
+        emit(result)
+        return
     emit(
         {
             key: result[key]

@@ -14,7 +14,15 @@ from eval.common import ROOT, atomic_json, read_json, sha256
 from eval.development import dataset_assets, verify_holdout
 from eval.evaluate import DIMENSIONS, CoverageOutput, Judge, evaluate_result, judge_call
 from eval.evidence import compact_business
-from eval.run_benchmark import Runner, config_valid, latest_attempt, read_attempt
+from eval.run_benchmark import (
+    ExecutionDecision,
+    Runner,
+    config_valid,
+    dry_run_plan,
+    latest_attempt,
+    read_attempt,
+    resolve_execution,
+)
 
 
 class API:
@@ -127,6 +135,38 @@ def test_development_identity_and_holdout_lock():
         dataset_assets("evaluation", "real")
 
 
+def test_legacy_api_process_failure_is_retryable_only_when_explicit():
+    """Legacy D05 API exit rows skip old Run recovery and require retry approval."""
+    row = {
+        "status": "failed",
+        "run_id": "old-run",
+        "error": {"type": "ControlledApiProcessExited"},
+    }
+    assert resolve_execution(row) == ExecutionDecision.PRESERVE_FAILED
+    assert resolve_execution(row, retry_failed=True) == ExecutionDecision.RETRY_FAILED
+
+
+def test_retry_dry_run_plans_one_new_d05_attempt(tmp_path):
+    """Retry dry-run reports only the next D05 attempt."""
+    directory = tmp_path / "dev-baseline-v2-d05"
+    attempt_dir = directory / "attempts" / "D05"
+    attempt_dir.mkdir(parents=True)
+    (attempt_dir / "attempt-0001.json").write_text(
+        json.dumps({
+            "question_id": "D05", "attempt_no": 1, "status": "failed",
+            "run_id": "old-run", "error": {"type": "ControlledApiProcessExited"},
+            "create_state": "confirmed", "request_identity": "request",
+            "thread_id": "thread", "experiment_id": "dev-baseline-v2-d05",
+        })
+    )
+    (attempt_dir / "events").mkdir()
+    plan = dry_run_plan(directory, "dev-baseline-v2-d05", [type("Q", (), {"question_id": "D05"})()], True)
+    assert plan["question_ids"] == ["D05"]
+    assert plan["planned_new_runs"] == 1
+    assert plan["questions"][0]["decision"] == "RETRY_FAILED"
+    assert plan["questions"][0]["planned_attempt_no"] == 2
+
+
 def test_missing_baseline_field_is_invalid():
     """Test missing baseline field is invalid."""
     _, _, baseline = dataset_assets("development", "fake")
@@ -198,6 +238,8 @@ async def test_timeout_running_resume_does_not_create_again(setup_runner):
     api.wait = True
     first = await runner.execute(question)
     assert first["api_status"] == "waiting_timeout"
+    assert first["execution_state"] == "RUNNER_TIMEOUT"
+    assert first["run_id"] == "run-1"
     identity = (first["thread_id"], first["run_id"])
     assert first["status"] != "failed" and first["finished_at"] is None
     active = await runner.execute(question, first, retry_failed=True)
@@ -211,6 +253,36 @@ async def test_timeout_running_resume_does_not_create_again(setup_runner):
     restored = await runner.execute(question, active)
     assert restored["status"] == "completed" and api.creates == 1
     assert (restored["thread_id"], restored["run_id"]) == identity
+
+
+@pytest.mark.asyncio
+async def test_confirmed_api_exit_finalizes_original_attempt_without_replacement(
+    setup_runner, monkeypatch
+):
+    """An API process exit fails the existing attempt and never auto-creates."""
+    from eval import runtime_status
+
+    runner, api, question = setup_runner
+    api.wait = True
+    monkeypatch.setattr(
+        runtime_status,
+        "api_runtime_status",
+        lambda: {
+            "state": "API_PROCESS_EXITED",
+            "exit_code": 23,
+            "last_health_success_at": "observed",
+            "detected_at": "observed",
+            "stdout_log": "stdout.log",
+            "stderr_log": "stderr.log",
+        },
+    )
+    first = await runner.execute(question)
+    assert first["status"] == "failed"
+    assert first["execution_state"] == "API_PROCESS_EXITED"
+    assert first["failure_origin"] == "langgraph_api_process"
+    assert first["run_id"] == "run-1" and api.creates == 1
+    preserved = await runner.execute(question, first)
+    assert preserved["run_id"] == "run-1" and api.creates == 1
 
 
 @pytest.mark.asyncio

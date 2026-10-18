@@ -74,8 +74,14 @@ class FailureObserver(AsyncCallbackHandler):
             if metrics
             else []
         )
-        stage = matching[-1]["role"] if matching else "graph"
+        matching_search = (
+            [e for e in metrics.search_request_events if e.get("_error_identity") == id(error)]
+            if metrics
+            else []
+        )
+        stage = matching[-1]["role"] if matching else "tavily_search" if matching_search else "graph"
         facts["failure_stage"] = stage
+        facts["failure_origin"] = "provider" if matching or matching_search or facts.get("http_status") else "agent"
         try:
             if frame.run_id:
                 repository = ResearchRepository()
@@ -89,6 +95,7 @@ class FailureObserver(AsyncCallbackHandler):
                     )
                 await repository.finalize_failed_run(frame.run_id, facts)
         except Exception as cleanup_error:
+            facts["failure_origin"] = "business_persistence"
             facts["database_finalization_error"] = error_facts(cleanup_error)
             logger.warning(
                 "Failure database transition failed: %s",

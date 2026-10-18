@@ -17,11 +17,12 @@ TEST_URI = f"postgresql+asyncpg://agentlab_metrics@127.0.0.1:55433/{TEST_DATABAS
 
 
 @pytest.fixture(autouse=True)
-def isolated_test_environment(monkeypatch):
+def isolated_test_environment(monkeypatch, tmp_path):
     """Override both database entries and prohibit external provider resolution."""
     monkeypatch.setenv("AGENTLAB_DATABASE_URI", TEST_URI)
     monkeypatch.setenv("DATABASE_URI", TEST_URI)
     monkeypatch.setenv("AGENTLAB_PROVIDER_MODE", "fake")
+    monkeypatch.setenv("AGENTLAB_RUNTIME_EVENTS_DIR", str(tmp_path / "runtime-events"))
     monkeypatch.setenv("LANGSMITH_TRACING", "false")
     monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
     resolve = socket.getaddrinfo

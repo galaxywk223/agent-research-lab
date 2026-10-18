@@ -1,0 +1,15 @@
+{
+  "eval_version": "v1",
+  "seed": 20261004,
+  "question_count": 10,
+  "questions_sha256": "9511f18eb766976a115d35768f56ee6910172458e69507082a42da867883bf76",
+  "created_at": "2026-10-04T03:33:35.092321+00:00",
+  "artifacts_sha256": {
+    "configs/baseline_v1.json": "77800b109e501da893f828a698b651e829cb23a72db2c5ac25863f6e45d7ef28",
+    "rubric_v1.json": "7349afe0af4efedca51cc31bf4ebbe9b68859cd9495d7cf06295a7f64dcfb782",
+    "protocol_v1.json": "e3e2ceb01a308d92bf666589efa0e7c2c6039e1bda8b6c479c7865642acda947",
+    "prompts/coverage_judge_v1.txt": "41ff016360f8300772a529a1510563455118fffb5253708b76a5939254fae31c",
+    "prompts/quality_judge_v1.txt": "8c424c3948e3e93dc32a17abc0989dea128035c26933a622e2c014c734e4cb91",
+    "prompts/pairwise_judge_v1.txt": "5087aa47496ceb5845e1c0a0b392debd69fc18de8d1b7f26aadaccf46e32bfa5"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "version": "v1",
+  "seed": 20261004,
+  "execution_order": "SHA-256(execution:v1:<seed>:<question_id>) first byte even: baseline_fixed then adaptive; odd: reverse",
+  "presentation_order": "same derivation using presentation namespace independently",
+  "pair_policy": "finish both strategies for one question before moving to the next question",
+  "pair_start_gap_limit_seconds": 3600,
+  "retain_temporal_violations": true,
+  "phase_2_2a_strategies": [
+    "baseline_fixed"
+  ],
+  "run_timeout_seconds": 1800,
+  "retry_usage_included": "unknown",
+  "token_semantics": "sum of usage returned by currently observable logical provider responses, not absolute billing tokens",
+  "evidence_preference": [
+    "provenance_verified_tavily_raw_content",
+    "provenance_verified_tavily_snippet",
+    "retrieved_research_notes"
+  ],
+  "evidence_per_item_char_limit": 1000,
+  "evidence_total_char_limit": 20000,
+  "judge_temperature": 0,
+  "judge_requires_explicit_model": true,
+  "pairwise_reason_categories": [
+    "completeness",
+    "relevance",
+    "evidence_presentation",
+    "synthesis",
+    "no_material_difference"
+  ]
+}
